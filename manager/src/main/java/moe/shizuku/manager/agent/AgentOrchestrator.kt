@@ -481,6 +481,9 @@ object AgentOrchestrator {
         // behavior change) so tuning (MAX_TOOL_ROUNDS, prompt size, history window)
         // can be driven by numbers instead of vibes. `round` was hoisted here for it.
         val taskStartMs = System.currentTimeMillis()
+        // reset the duplicate-failed-call tracker — every NEW task may retry.
+        lastToolKey = null
+        lastToolFailed = false
         var round = 0
         // r1419 — park-check guard: only a continuation CREATED BY THIS RUN may
         // park the task. Previously ANY still-scheduled row of the conversation
@@ -493,14 +496,23 @@ object AgentOrchestrator {
             while (true) {
                 if (cancelled) { saveCancelled(context, convId, steps); return }
 
-                // r1418 (M5): PAIR-AWARE history window — a raw takeLast(12) could
-                // start on a tool row whose assistant marker row was evicted, which
-                // sends an orphaned role:"tool"/functionResponse to the provider
-                // (hard 400 = another mid-task death). Drop leading orphans.
+                // r1418 (M5): PAIR-AWARE history window — a raw takeLast could
+                // start on a tool row whose assistant marker row was evicted,
+                // which sends an orphaned role:"tool"/functionResponse to the
+                // provider (hard 400 = another mid-task death). Drop leading
+                // orphans. CRITIC FIX #5 (team B): drop TRAILING orphan
+                // MARKERS too — a crash between the marker insert and the
+                // result insert (OOM decoding a screen_vision frame, SQLite
+                // failure) used to poison ~20 subsequent rounds with a
+                // tool_calls row that has no tool response.
                 var recentRows = MemoryRepository.messages(context, convId, HISTORY_LIMIT * 4)
                     .takeLast(HISTORY_LIMIT)
                 while (recentRows.isNotEmpty() && recentRows.first().role == "tool") {
                     recentRows = recentRows.drop(1)
+                }
+                while (recentRows.isNotEmpty() && recentRows.last().role == "assistant" &&
+                    recentRows.last().toolName != null) {
+                    recentRows = recentRows.dropLast(1)
                 }
                 val history = toLlmHistory(recentRows)
                 val systemPrompt = AgentIdentity.systemPrompt(
@@ -527,6 +539,10 @@ object AgentOrchestrator {
                         round++
                         if (round % 25 == 0) {
                             Log.i(TAG, "long task: $round tool rounds (runs until done or user stop)")
+                            // CRITIC FIX #1 (team B): progress the USER can see
+                            // — a Logcat-only line is invisible to them.
+                            MemoryRepository.addMessage(context, convId, "assistant",
+                                "⏳ لا يزال العمل على نفس المهمة (الجولة $round من الأدوات) — أستمر حتى تكتمل أو تضغط زر التوقف.")
                         }
                         for (call in decision.calls) {
                             if (cancelled) { saveCancelled(context, convId, steps); return }
@@ -593,12 +609,17 @@ object AgentOrchestrator {
      */
     private fun toLlmHistory(rows: List<ChatMessage>): List<LlmMessage> =
         rows.map { m ->
+            // CRITIC FIX #7 (team B): per-row caps — a 40-row window with
+            // unbounded 9,000-char tool rows could exceed small providers
+            // (hard 400 on EVERY round = dead task).
             when {
                 m.role == "auto" ->
-                    LlmMessage("assistant", "[shell] " + m.content)
+                    LlmMessage("assistant", "[shell] " + m.content.take(2000))
                 m.role == "assistant" && m.toolName != null ->
-                    LlmMessage("assistant", m.content.ifBlank { "{}" }, m.toolName, m.content.ifBlank { "{}" }, null)
-                else -> LlmMessage(m.role, m.content, m.toolName, null, m.toolOk)
+                    LlmMessage("assistant", m.content.take(800).ifBlank { "{}" }, m.toolName, m.content.take(800).ifBlank { "{}" }, null)
+                m.role == "tool" ->
+                    LlmMessage(m.role, m.content.take(2500), m.toolName, null, m.toolOk)
+                else -> LlmMessage(m.role, m.content.take(6000), m.toolName, null, m.toolOk)
             }
         }
 
@@ -722,6 +743,30 @@ object AgentOrchestrator {
         }
     }
 
+    /** CRITIC FIX #6 (team B): the working-memory rewrite is O(n²) with
+     *  unbounded rounds — persist only the LAST 40 step entries (the in-memory
+     *  steps stays complete for ResultVerifier). */
+    private fun stepsForPersist(steps: JSONArray): String {
+        val n = steps.length()
+        if (n <= 40) return steps.toString()
+        val trimmed = JSONArray()
+        for (i in (n - 40) until n) {
+            steps.optJSONObject(i)?.let { trimmed.put(it) }
+        }
+        return trimmed.toString()
+    }
+
+    // CRITIC FIX #1c (team B): an identical call that JUST failed is skipped —
+    // with the round cap gone, a stuck model re-issuing the same failing call
+    // must not burn rounds forever.
+    private var lastToolKey: String? = null
+    private var lastToolFailed = false
+    // CRITIC FIX #4 (team B): secrets never relayed (same discipline as the
+    // live path — screen_vision can read a Keys page the user left open).
+    private val SECRET_REDACT = Regex(
+        "(?i)(nvapi-[A-Za-z0-9_\\-]{8,}|authorization:\\s*bearer\\s+\\S+|api[_-]?key\\s*[=:]\\s*\\S+)"
+    )
+
     private suspend fun executeToolCall(context: Context, convId: Long, call: ToolCall, steps: JSONArray) {
         // Tool Router: only registered tools are executed - unknown names are rejected.
         val tool = ToolRegistry.get(call.name)
@@ -736,6 +781,20 @@ object AgentOrchestrator {
             return
         }
 
+        // duplicate-failed-call skip (honest, model-visible)
+        val callKey = call.name + "|" + call.argsJson.toString().take(300)
+        val repeatFail = callKey == lastToolKey && lastToolFailed
+        lastToolKey = callKey
+        if (repeatFail) {
+            val msg = "skipped_duplicate_failed_call: the previous identical $call.name call FAILED " +
+                "— re-running it unchanged wastes the run; change the arguments/approach or report the blocker honestly."
+            MemoryRepository.addMessage(context, convId, "tool", msg, call.name, false)
+            steps.put(JSONObject().put("type", "result").put("tool", call.name)
+                .put("ok", false).put("output", msg))
+            lastToolFailed = true
+            return
+        }
+
         publish(context, convId, AgentStatus.ExecutingTool(call.name))
         // tool-call marker row; content = args JSON (round-trips to the provider)
         MemoryRepository.addMessage(context, convId, "assistant", call.argsJson.toString(), call.name, null)
@@ -743,16 +802,22 @@ object AgentOrchestrator {
         val result = withContext(Dispatchers.IO) {
             try {
                 tool.run(context, call.argsJson)
-            } catch (e: Exception) {
-                AgentTools.ToolResult(false, "tool_crash: ${e.message ?: e.javaClass.simpleName}")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // CRITIC FIX #5 (team B): Throwable, not Exception — an OOM
+                // decoding a vision frame used to escape and orphan the marker.
+                AgentTools.ToolResult(false, "tool_crash: ${t.message ?: t.javaClass.simpleName}")
             }
         }
+        lastToolFailed = !result.ok
 
-        MemoryRepository.addMessage(context, convId, "tool", result.output.take(9000), call.name, result.ok)
+        val redacted = SECRET_REDACT.replace(result.output, "***")
+        MemoryRepository.addMessage(context, convId, "tool", redacted.take(9000), call.name, result.ok)
         steps.put(JSONObject().put("type", "result").put("tool", call.name)
-            .put("ok", result.ok).put("output", result.output.take(1500)))
+            .put("ok", result.ok).put("output", redacted.take(1500)))
         val wm = MemoryRepository.working(context, convId)
-        MemoryRepository.saveWorking(context, convId, wm?.first ?: "", steps.toString(), "running")
+        MemoryRepository.saveWorking(context, convId, wm?.first ?: "", stepsForPersist(steps), "running")
     }
 
     private suspend fun saveAssistant(context: Context, convId: Long, text: String) {

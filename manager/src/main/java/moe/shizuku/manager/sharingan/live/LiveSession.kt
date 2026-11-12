@@ -26,32 +26,50 @@ import java.util.concurrent.atomic.AtomicInteger
  * DELETED — «الكثير من العيون بدون فائدة، نريد الجانبية التي تشبه Gemini»).
  *
  * Per heard utterance:
- *   1. Echo gate: finals spoken while the assistant ITSELF is speaking (and a
- *      600ms tail window) are IGNORED — the mic hears the TTS on speakerphone
- *      and must never transcribe its own voice (expert-audit CRITICAL).
+ *   1. Echo gate (critic fix #1): finals are dropped while the assistant's
+ *      TTS is STILL PLAYING (audio truth: phase==SPEAKING OR isSpeaking) or
+ *      within a 900ms tail — the mic never transcribes/executes its own
+ *      voice, even when a phase post reordered.
  *   2. TranscriptCorrector fixes the ASR text (Darija + app names); the raw
  *      stop-command check runs BEFORE the network roundtrip.
  *   3. The row lands in the CHAT (ChatRelay) — nothing is ever silent.
  *   4. LiveVision captures the REAL screen pixels (screencap→PNG→JPEG).
- *      NEW — IDLE WATCH: while LISTENING a fresh frame is captured every ~4s
- *      (md5-gated freshness) so the turn that follows starts from the
- *      FRESHEST possible screen with near-zero latency — the eye truly
- *      watches continuously like Gemini, not only at speech time.
+ *      IDLE WATCH (Gemini-style continuity): while LISTENING a fresh frame
+ *      is captured every ~4s; a turn consumes it ONCE (round 1 only — critic
+ *      fix #3: rounds ≥2 always capture fresh so `read` sees the RESULT of
+ *      the actions, never the pre-action screen).
  *   5. LiveBrain sees the frame + reads the corrected command → JSON
  *      {say, actions, done}; say is SPOKEN FIRST (hands-disabled user).
- *      NEW — SESSION MEMORY: decisions ride a persisted multi-turn history
+ *      SESSION MEMORY: decisions ride a persisted multi-turn history
  *      (filesDir/sharingan/live_history.json) — the eye RESUMES its context
  *      after stop/start («لا أريده أن يتوقف ثم ينسى السياق»).
  *   6. Actions execute through the real shell, each with an honest chat row.
  *      Destructive shell patterns are DENIED outright (no hands to confirm).
- *   7. `read` actions pull a FRESH frame (max 8 rounds — the old 3 could
- *      abort mid-GUI-task) → the brain sees the RESULT of its own actions.
- *   8. The ear NEVER stops: barge-in partials kill the TTS mid-sentence.
+ *   7. `read` actions pull a FRESH frame (max 8 rounds per utterance) → the
+ *      brain sees the RESULT of its own actions (visual verification).
+ *   8. The ear NEVER stops: barge-in partials kill the TTS mid-sentence —
+ *      but only after TWO consecutive partials (critic fix #8: a single
+ *      spurious echo partial no longer makes the assistant cut ITSELF off).
  *
- * Concurrency: the turn admission is a synchronized check-and-set
- * (turnLock guards turnBusy + pendingUtterance together), so spoken commands
- * are never lost, never duplicated, never resurrected across sessions.
- * A generation token invalidates every async callback on stop().
+ * Critic-team fixes applied (v2.2.0-alpha, Task IDs 7-a/7-b):
+ *  #1 echo gate on audio truth (not phase posts) + 900ms tail;
+ *  #2 the greeting turn ARMS turnBusy — spoken commands queue instead of
+ *     racing the greeting (no more concurrent turns / TTS self-cancellation);
+ *  #3 watched frame consumed ONCE (round 1) and cleared before any action;
+ *  #4 every turn captures the session generation; a stale turn from session
+ *     A can never speak/relay/remember into session B;
+ *  #5 start() is fully async — the mic `pm grant` can never runBlocking the
+ *     MAIN thread into an ANR (a hands-disabled user cannot dismiss one);
+ *  #6 pendingUtterance slot → FIFO ArrayDeque (two quick commands are both
+ *     kept, never overwritten);
+ *  #7 (LiveBrain) history persist is atomic tmp+rename;
+ *  #8 barge-in needs two consecutive echo partials;
+ *  #9 a late TTS-init callback no longer re-boots a working ear;
+ *  #10 the watched frame+timestamp live in ONE immutable holder, cleared on
+ *     stop and after consumption.
+ *
+ * Concurrency: turnBusy + the pending queue ALWAYS mutate together under
+ * turnLock; a generation token invalidates every async callback on stop().
  */
 object LiveSession {
 
@@ -62,6 +80,8 @@ object LiveSession {
         private set
     @Volatile var running: Boolean = false
         private set
+    /** Boot window: start() launched its async checks; stop() must still work. */
+    @Volatile private var booting = false
 
     private val guard = CoroutineExceptionHandler { _, e ->
         Log.e(TAG, "live crash", e)
@@ -78,11 +98,11 @@ object LiveSession {
     private var ear: LiveEar? = null
     private var turnJob: kotlinx.coroutines.Job? = null
 
-    // Turn state machine — turnBusy + pendingUtterance ALWAYS mutate together
-    // under turnLock (expert audit findings: stale reads, lost/duplicated cmds).
+    // Turn state machine — turnBusy + pendingQueue ALWAYS mutate together
+    // under turnLock (critic fix #6: FIFO queue, never an overwrite slot).
     private val turnLock = Any()
     private var turnBusy = false
-    private var pendingUtterance: String? = null
+    private val pendingQueue = ArrayDeque<String>()
 
     // Session generation — every async callback captures it; stop() bumps it
     // so stale callbacks (TTS init, ear creation) can never resurrect state.
@@ -90,142 +110,173 @@ object LiveSession {
 
     // Echo gate: the assistant must never hear itself (speakerphone loop).
     @Volatile private var lastTtsDoneAt: Long = 0
-    private val echoTailMs = 600L
+    private val echoTailMs = 900L
 
-    // IDLE WATCH: the freshest frame captured while LISTENING (Gemini-like
-    // continuous watching; the turn consumes it if still fresh).
-    @Volatile private var watchedFrame: LiveVision.Frame? = null
-    @Volatile private var watchedAt: Long = 0L
+    // Barge-in debounce (critic fix #8): two consecutive partials within
+    // 2.5s = real user speech; a single spurious echo partial is ignored.
+    private var bargeConsec = 0
+    private var bargeLastAt = 0L
+
+    // IDLE WATCH (critic fix #10): ONE immutable holder for frame+timestamp —
+    // a reader can never pair an old frame with a new timestamp. Consumed
+    // once, cleared on stop, cleared before any action executes.
+    private data class Watched(val frame: LiveVision.Frame, val at: Long)
+    @Volatile private var watched: Watched? = null
     private val watchFreshMs = 8_000L
 
     @Volatile private var sessionContext: Context? = null
 
     // ---------- lifecycle ----------
 
-    /** THE ONE BUTTON: eye tap → live starts (or stops if already live). */
+    /** THE ONE BUTTON: eye tap → live starts (or stops if already live/booting). */
     fun toggle(context: Context) {
-        if (running) stop(context) else start(context)
+        if (running || booting) stop(context) else start(context)
     }
 
     fun start(context: Context) {
-        if (running) return
+        if (running || booting) return
         val app = context.applicationContext
         sessionContext = app
         val myGen = gen.incrementAndGet()
+        booting = true
         scope = CoroutineScope(SupervisorJob() + Dispatchers.IO + guard)
 
-        // 1) Mic permission — REQUIRED for «تسمع الكلام مباشرة».
-        //    HANDS-FREE FIRST: the user cannot touch a system dialog. The
-        //    feature already requires the Shizuku shell, and `pm grant` from
-        //    the shell identity is legal — try it; the dialog is the FALLBACK.
-        if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            var granted = kotlinx.coroutines.runBlocking {
-                kotlinx.coroutines.withContext(Dispatchers.IO) {
-                    if (!ShizukuExec.available()) return@withContext false
-                    val r = ShizukuExec.oneShot(
-                        "pm grant ${app.packageName} android.permission.RECORD_AUDIO", 10_000)
-                    r.ok && ContextCompat.checkSelfPermission(
-                        app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-                }
-            }
-            if (!granted) {
-                ChatRelay.note(app, "👁‍🗨 البث يريد إذن الميكرو — فتحنا صفحة الإذن (آخر مرة تحتاج تلمس فيها).")
-                val i = Intent(app, SharinganPermissionActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                try { app.startActivity(i) } catch (t: Throwable) {
-                    Log.e(TAG, "permission activity launch failed", t)
-                }
-                return
-            }
-        }
-
-        // 2) Shell — frames + actions are shell-born; honest refusal otherwise.
-        if (!ShizukuExec.available()) {
-            ChatRelay.note(app, "⚠️ ما نقدرش نبدا البث: خدمة الشيل (aMiNo) ماشي مرّوطة — فعّلها من التطبيق أولا.")
-            AlgerianVoice.init(app) { AlgerianVoice.speak(AlgerianVoice.Phrases.needShell()) }
-            return
-        }
-
-        // Honest provider note (audit: silent builtin fallback must be visible).
-        if (LiveKeys.overrideWithOpenAiCompat(app) && LiveKeys.creds(app).builtin) {
-            ChatRelay.note(app, "ℹ️ طلبت توجيه البث لمفتاحك الشخصي لكنه غير محفوظ — رجعنا للمسار المدمج.")
-        }
-
-        running = true
-        turnBusy = false
-        pendingUtterance = null
-        enterListening()
-
-        // SESSION MEMORY: reload what the previous live session remembered —
-        // the context is never thrown away by a stop.
-        val resumed = try { LiveBrain.historyLoad(app) } catch (_: Throwable) { false }
-        if (resumed) {
-            ChatRelay.note(app, "👁 رجعنا البث — ذاكرة السياق مستأنفة (${LiveBrain.historySize()} رسالة من الجلسة السابقة).")
-        }
-
-        // THE ONE EYE — the side bubble carries the whole live look now
-        // (Amaterasu tears + phase breathing). No second window anywhere.
-        SharinganBubble.setLiveMode(true)
-
-        ChatRelay.note(app, "👁‍🗨 الشارينغان لايف بدا — قول أي أمر بالدارجة، ونفسي نفّذ وأتحقق. ضغطة على العين توقف البث.")
-
-        // 4) Voice engine → ear → greeting. A 5s watchdog guarantees the ear
-        //    exists even if the TTS engine wedges (audit: "deaf session").
-        AlgerianVoice.init(app) { ready ->
-            if (gen.get() != myGen || !running) return@init
-            if (!ready) {
-                ChatRelay.note(app, "⚠️ محرك النطق ما خدمش — البث يبقى يسمع وينفذ ويرد في الشات بلا صوت.")
-            }
-            main.post {
-                if (gen.get() != myGen || !running) return@post
-                // Utterance finished → back to listening + arm the echo tail.
-                AlgerianVoice.onUtteranceDone = {
-                    lastTtsDoneAt = System.currentTimeMillis()
-                    if (running && phase == LivePhase.SPEAKING) enterListening()
-                }
-                bootEar(app, myGen)
-            }
-        }
-        main.postDelayed({
-            if (gen.get() == myGen && running && ear == null) {
-                Log.w(TAG, "TTS init watchdog: booting ear without voice")
-                bootEar(app, myGen)
-            }
-        }, 5_000)
-
-        // Greeting: describe the CURRENT screen in Darija (real vision, not OCR).
-        val sc = scope ?: return
-        turnJob = sc.launch {
+        // CRITIC FIX #5: the WHOLE boot is async on IO — the mic `pm grant`
+        // roundtrip (up to 10s) can never runBlocking the main thread into an
+        // ANR (the user has no hands to dismiss one).
+        val bootScope = scope ?: return
+        bootScope.launch {
+            var bootOk = false
             try {
-                greetingTurn(app, resumed)
-                drainQueue(app)
-            } finally {
-                synchronized(turnLock) { turnBusy = false }
-                if (running) enterListening()
-            }
-        }
-
-        // IDLE WATCH loop — continuous Gemini-style watching: while the
-        // session is idle (LISTENING, no turn running) it keeps the freshest
-        // frame ready, so the next spoken command is answered from a screen
-        // captured SECONDS ago (md5-freshness, no burn-in of old frames).
-        val watcherGen = myGen
-        sc.launch {
-            while (running && gen.get() == watcherGen) {
-                val idle = synchronized(turnLock) { !turnBusy } &&
-                    phase == LivePhase.LISTENING
-                if (idle) {
-                    try {
-                        val f = LiveVision.captureFrame(app)
-                        if (f != null && gen.get() == watcherGen) {
-                            watchedFrame = f
-                            watchedAt = System.currentTimeMillis()
+                // 1) Mic permission — REQUIRED for «تسمع الكلام مباشرة».
+                //    HANDS-FREE FIRST: `pm grant` from the shell identity is
+                //    legal; the touch dialog is only the FALLBACK.
+                if (ContextCompat.checkSelfPermission(app, Manifest.permission.RECORD_AUDIO)
+                    != PackageManager.PERMISSION_GRANTED) {
+                    val granted = if (!ShizukuExec.available()) false else {
+                        val r = ShizukuExec.oneShot(
+                            "pm grant ${app.packageName} android.permission.RECORD_AUDIO", 10_000)
+                        r.ok && ContextCompat.checkSelfPermission(
+                            app, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                    }
+                    if (gen.get() != myGen) return@launch
+                    if (!granted) {
+                        ChatRelay.note(app, "👁‍🗨 البث يريد إذن الميكرو — فتحنا صفحة الإذن (آخر مرة تحتاج تلمس فيها).")
+                        val i = Intent(app, SharinganPermissionActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        try { app.startActivity(i) } catch (t: Throwable) {
+                            Log.e(TAG, "permission activity launch failed", t)
                         }
-                    } catch (_: Throwable) {}
-                    kotlinx.coroutines.delay(4_000)
-                } else {
-                    kotlinx.coroutines.delay(1_200)
+                        return@launch
+                    }
+                }
+
+                // 2) Shell — frames + actions are shell-born; honest refusal.
+                if (!ShizukuExec.available()) {
+                    ChatRelay.note(app, "⚠️ ما نقدرش نبدا البث: خدمة الشيل (aMiNo) ماشي مرّوطة — فعّلها من التطبيق أولا.")
+                    AlgerianVoice.init(app) { AlgerianVoice.speak(AlgerianVoice.Phrases.needShell()) }
+                    return@launch
+                }
+                if (gen.get() != myGen) return@launch
+
+                // Honest provider note (audit: silent builtin fallback visible).
+                if (LiveKeys.overrideWithOpenAiCompat(app) && LiveKeys.creds(app).builtin) {
+                    ChatRelay.note(app, "ℹ️ طلبت توجيه البث لمفتاحك الشخصي لكنه غير محفوظ — رجعنا للمسار المدمج.")
+                }
+                bootOk = true
+            } finally {
+                if (!bootOk) {
+                    // Failed boot: release everything the tap allocated.
+                    booting = false
+                    gen.incrementAndGet()          // invalidate every callback
+                    main.post { ear?.stop(); ear = null }
+                    SharinganBubble.setLiveMode(false)
+                    scope?.cancel()
+                    scope = null
+                    sessionContext = null
+                }
+            }
+            if (gen.get() != myGen || !bootOk) return@launch
+            booting = false
+            running = true
+            synchronized(turnLock) { turnBusy = false; pendingQueue.clear() }
+            enterListening()
+
+            // THE ONE EYE — the side bubble carries the whole live look now
+            // (Amaterasu tears + phase breathing). No second window anywhere.
+            SharinganBubble.setLiveMode(true)
+
+            ChatRelay.note(app, "👁‍🗨 الشارينغان لايف بدا — قول أي أمر بالدارجة، ونفسي نفّذ وأتحقق. ضغطة على العين توقف البث.")
+
+            // 3) Voice engine → ear → greeting. A 5s watchdog guarantees the
+            //    ear exists even if the TTS engine wedges (audit: deaf session).
+            AlgerianVoice.init(app) { ready ->
+                if (gen.get() != myGen || !running) return@init
+                if (!ready) {
+                    ChatRelay.note(app, "⚠️ محرك النطق ما خدمش — البث يبقى يسمع وينفذ ويرد في الشات بلا صوت.")
+                }
+                main.post {
+                    if (gen.get() != myGen || !running) return@post
+                    // Utterance finished → back to listening + arm the echo tail.
+                    AlgerianVoice.onUtteranceDone = {
+                        lastTtsDoneAt = System.currentTimeMillis()
+                        if (running && phase == LivePhase.SPEAKING &&
+                            !AlgerianVoice.isSpeaking) enterListening()
+                    }
+                    // CRITIC FIX #9: the late TTS callback re-arms callbacks
+                    // but must NEVER re-boot a working ear (a 200-500ms deaf
+                    // window mid-session used to follow).
+                    if (ear == null) bootEar(app, myGen)
+                }
+            }
+            main.postDelayed({
+                if (gen.get() == myGen && running && ear == null) {
+                    Log.w(TAG, "TTS init watchdog: booting ear without voice")
+                    bootEar(app, myGen)
+                }
+            }, 5_000)
+
+            // Greeting turn — critic fix #2: it ARMS turnBusy like any turn,
+            // so commands spoken during the greeting QUEUE (never race it).
+            turnJob = bootScope.launch {
+                val turnGen = gen.get()
+                synchronized(turnLock) { turnBusy = true }
+                try {
+                    // CRITIC FIX #12: history IO happens here on IO, not on
+                    // the main thread that tapped the bubble.
+                    val resumed = try { LiveBrain.historyLoad(app) } catch (_: Throwable) { false }
+                    if (resumed) {
+                        ChatRelay.note(app, "👁 رجعنا البث — ذاكرة السياق مستأنفة (${LiveBrain.historySize()} رسالة من الجلسة السابقة).")
+                    }
+                    greetingTurn(app, resumed, turnGen)
+                    drainQueue(app, turnGen)
+                } finally {
+                    synchronized(turnLock) { turnBusy = false }
+                    // CRITIC FIX #1: leave SPEAKING alone while TTS is still
+                    // on-air — onUtteranceDone drives the transition.
+                    if (running && gen.get() == turnGen && !AlgerianVoice.isSpeaking) enterListening()
+                }
+            }
+
+            // IDLE WATCH loop — continuous Gemini-style watching (critic fix
+            // #3/#10): the freshest frame is consumed ONCE by the next turn's
+            // round 1; the loop keeps it young while LISTENING only.
+            val watcherGen = myGen
+            launch {
+                while (running && gen.get() == watcherGen) {
+                    val idle = synchronized(turnLock) { !turnBusy } &&
+                        phase == LivePhase.LISTENING
+                    if (idle) {
+                        try {
+                            val f = LiveVision.captureFrame(app)
+                            if (f != null && gen.get() == watcherGen) {
+                                watched = Watched(f, System.currentTimeMillis())
+                            }
+                        } catch (_: Throwable) {}
+                        kotlinx.coroutines.delay(4_000)
+                    } else {
+                        kotlinx.coroutines.delay(1_200)
+                    }
                 }
             }
         }
@@ -237,10 +288,18 @@ object LiveSession {
             app,
             onFinal = { text -> onUtterance(text) },
             onPartialBargeIn = {
-                // BARGE-IN: any real partial speech while speaking → stop TTS.
+                // BARGE-IN (critic fix #8): a real user interrupt produces
+                // SEVERAL partials in quick succession — one spurious echo
+                // partial must not make the assistant cut ITSELF off.
                 if (phase == LivePhase.SPEAKING && AlgerianVoice.isSpeaking) {
-                    AlgerianVoice.stop()
-                    enterListening()
+                    val now = System.currentTimeMillis()
+                    bargeConsec = if (now - bargeLastAt < 2_500) bargeConsec + 1 else 1
+                    bargeLastAt = now
+                    if (bargeConsec >= 2) {
+                        bargeConsec = 0
+                        AlgerianVoice.stop()
+                        enterListening()
+                    }
                 }
             },
             onFatal = { reason ->
@@ -257,10 +316,14 @@ object LiveSession {
     }
 
     fun stop(context: Context) {
-        if (!running) return
+        // CRITIC FIX #5 companion: stop() works during the boot window too —
+        // a tap during the async checks always cancels cleanly.
+        if (!running && !booting) return
         running = false
+        booting = false
         val myGen = gen.incrementAndGet()   // every async callback is now stale
         phase = LivePhase.LISTENING
+        watched = null
         main.post {
             ear?.stop(); ear = null
         }
@@ -271,8 +334,8 @@ object LiveSession {
         AlgerianVoice.speak(AlgerianVoice.Phrases.stopped())
         synchronized(turnLock) {
             turnBusy = false
-            pendingUtterance = null   // a queued command of session A never
-        }                             // auto-executes in session B
+            pendingQueue.clear()   // a queued command of session A never
+        }                          // auto-executes in session B
         turnJob?.cancel()
         turnJob = null
         scope?.cancel()
@@ -295,11 +358,11 @@ object LiveSession {
 
     // ---------- turns ----------
 
-    private suspend fun greetingTurn(app: Context, resumed: Boolean) {
+    private suspend fun greetingTurn(app: Context, resumed: Boolean, turnGen: Int) {
         enterPhase(LivePhase.THINKING)
         val frame = LiveVision.captureFrame(app) ?: run {
             ChatRelay.note(app, "⚠️ ما نجملت لقطة الشاشة — تحقق من خدمة الشيل.")
-            speakIfRunning(app, AlgerianVoice.Phrases.frameFail())
+            speakIfRunning(app, AlgerianVoice.Phrases.frameFail(), turnGen)
             enterListening()
             return
         }
@@ -309,9 +372,11 @@ object LiveSession {
         else
             "البث بدا توّا. قدّم نفسك بجملة قصيرة بالدارجة وصف وشاشة المستخدم توا (شنو يبان فعلاً). done=true, actions=[]."
         val decision = LiveBrain.vision(app, system, instruction, "", frame.b64Jpeg)
+        // CRITIC FIX #4: a stale session-A greeting never speaks into B.
+        if (gen.get() != turnGen) return
         val say = decision.say.ifBlank { AlgerianVoice.Phrases.started() }
         ChatRelay.assistant(app, "👁 $say")
-        speakIfRunning(app, say)
+        speakIfRunning(app, say, turnGen)
     }
 
     /** A final ASR result arrived → full watch-hear-act turn. */
@@ -324,18 +389,20 @@ object LiveSession {
             stop(app)
             return
         }
-        // ECHO GATE (expert audit CRITICAL #4/#49): finals while the assistant
-        // is speaking are its own voice on the speakerphone — never transcribe
-        // yourself, never execute your own words. Plus a tail window after.
-        if (phase == LivePhase.SPEAKING) return
+        // ECHO GATE (critic fix #1): audio TRUTH, not phase posts. Finals
+        // while the assistant is speaking (phase OR the engine is actually
+        // playing) or within the 900ms tail are its own speakerphone voice —
+        // dropped, never queued, never executed.
+        if (phase == LivePhase.SPEAKING || AlgerianVoice.isSpeaking) return
         if (System.currentTimeMillis() - lastTtsDoneAt < echoTailMs) return
 
         val app = sessionContext ?: return
         // Race-free admission: under turnLock, either this utterance STARTS a
-        // turn or it is safely QUEUED (never dropped, never duplicated).
+        // turn or it is safely QUEUED FIFO (critic fix #6: two quick commands
+        // are both kept — a slot used to destroy the first).
         val admitted = synchronized(turnLock) {
             if (turnBusy) {
-                pendingUtterance = rawText
+                pendingQueue.addLast(rawText)
                 false
             } else {
                 turnBusy = true
@@ -344,57 +411,62 @@ object LiveSession {
         }
         if (!admitted) return
         val sc = scope ?: run { synchronized(turnLock) { turnBusy = false }; return }
+        // CRITIC FIX #4: the turn captures the session generation — a turn
+        // from session A can never resurrect under session B.
+        val turnGen = gen.get()
         turnJob = sc.launch {
             try {
                 var current = rawText
-                while (running) {
-                    executeTurn(app, current)
-                    if (!running) break
+                while (running && gen.get() == turnGen) {
+                    executeTurn(app, current, turnGen)
+                    if (!running || gen.get() != turnGen) break
                     val next = synchronized(turnLock) {
-                        pendingUtterance.also { pendingUtterance = null }
+                        if (pendingQueue.isEmpty()) null else pendingQueue.removeFirst()
                     } ?: break
                     current = next
                 }
             } finally {
                 // Late arrivals between the last drain and release are picked
                 // up here — the queue can never strand a spoken command.
-                while (running) {
+                while (running && gen.get() == turnGen) {
                     val late = synchronized(turnLock) {
-                        if (turnBusy && pendingUtterance != null) {
-                            pendingUtterance.also { pendingUtterance = null }
+                        if (turnBusy && pendingQueue.isNotEmpty()) {
+                            pendingQueue.removeFirst()
                         } else {
                             turnBusy = false
                             null
                         }
                     } ?: break
-                    try { executeTurn(app, late) } catch (t: Throwable) {
+                    try { executeTurn(app, late, turnGen) } catch (t: Throwable) {
                         Log.e(TAG, "late turn failed", t)
                     }
                 }
                 synchronized(turnLock) { turnBusy = false }
-                if (running) enterListening()
+                // CRITIC FIX #1: only flip to LISTENING when the voice is
+                // really done — onUtteranceDone covers the rest.
+                if (running && gen.get() == turnGen && !AlgerianVoice.isSpeaking) enterListening()
             }
         }
     }
 
     /** Drain queued commands after the greeting turn (same loop semantics). */
-    private suspend fun drainQueue(app: Context) {
-        while (running) {
+    private suspend fun drainQueue(app: Context, turnGen: Int) {
+        while (running && gen.get() == turnGen) {
             val next = synchronized(turnLock) {
-                pendingUtterance.also { pendingUtterance = null }
+                if (pendingQueue.isEmpty()) null else pendingQueue.removeFirst()
             } ?: break
-            executeTurn(app, next)
+            executeTurn(app, next, turnGen)
         }
     }
 
     /** Speak only if the session is still alive (no zombie speech after stop). */
-    private suspend fun speakIfRunning(app: Context, text: String) {
-        if (!running) return
+    private suspend fun speakIfRunning(app: Context, text: String, turnGen: Int) {
+        if (!running || gen.get() != turnGen) return
         enterPhase(LivePhase.SPEAKING)
         AlgerianVoice.speak(text)
     }
 
-    private suspend fun executeTurn(app: Context, rawVoice: String) {
+    private suspend fun executeTurn(app: Context, rawVoice: String, turnGen: Int) {
         enterPhase(LivePhase.THINKING)
         ChatRelay.beginTurn(app)
 
@@ -403,7 +475,7 @@ object LiveSession {
             Regex("^\\s*(وقف|توقف|التوقف|بريك|بس|كفي|صافي|وقف البث|توقف البث|إيقاف البث|الغاء البث|إلغاء البث|arret|stop)\\s*[.!؟?]*$")
                 .containsMatchIn(rawVoice.trim())
         if (stopLike) {
-            speakIfRunning(app, AlgerianVoice.Phrases.stopAck())
+            speakIfRunning(app, AlgerianVoice.Phrases.stopAck(), turnGen)
             stop(app)
             return
         }
@@ -418,17 +490,23 @@ object LiveSession {
         var executedSummary = ""
         var finalSay: String? = null
         for (round in 1..8) {
-            if (!running) return
+            if (!running || gen.get() != turnGen) return
             enterPhase(LivePhase.THINKING)
-            // The idle watch keeps a FRESH frame ready — use it when young
-            // (Gemini-like continuity), otherwise capture now.
-            val frame = watchedFrame?.takeIf {
-                System.currentTimeMillis() - watchedAt < watchFreshMs
-            } ?: LiveVision.captureFrame(app)
+            // CRITIC FIX #3: the watched frame feeds ROUND 1 ONLY and is
+            // consumed once; rounds ≥2 ALWAYS capture fresh — a `read` must
+            // see the screen AFTER the actions, never the pre-action frame.
+            val frame: LiveVision.Frame? = if (round == 1) {
+                val w = watched
+                watched = null
+                w?.takeIf { System.currentTimeMillis() - it.at < watchFreshMs }?.frame
+                    ?: LiveVision.captureFrame(app)
+            } else {
+                LiveVision.captureFrame(app)
+            }
             if (frame == null) {
                 finalSay = AlgerianVoice.Phrases.frameFail()
                 ChatRelay.note(app, "⚠️ فشل التقاط الإطار (الشيل طاح؟)")
-                speakIfRunning(app, finalSay)
+                speakIfRunning(app, finalSay, turnGen)
                 return
             }
             val system = LiveBrain.systemPrompt(app, frame.realW, frame.realH, frame.analysisH)
@@ -437,26 +515,30 @@ object LiveSession {
             else
                 "واصل المهمة الأصلية: «$corrected» — انظر اللقطة الجديدة بعد التنفيذ وأكمل أو أنهي."
             val decision = LiveBrain.vision(app, system, instruction, executedSummary, frame.b64Jpeg)
-            if (!running) return
+            // CRITIC FIX #4: a decision that lands AFTER stop()/re-start()
+            // belongs to a dead session — nothing is spoken, relayed or
+            // remembered from it.
+            if (!running || gen.get() != turnGen) return
 
             // 3) Speak the ack FIRST (the user hears progress, hands-free).
             if (decision.say.isNotBlank()) {
                 ChatRelay.assistant(app, decision.say)
                 finalSay = decision.say
-                speakIfRunning(app, decision.say)
+                speakIfRunning(app, decision.say, turnGen)
             }
 
             if (decision.actions.isEmpty() || decision.done) break
 
             // 4) Execute actions through the REAL shell, honest rows in chat.
             enterPhase(LivePhase.EXECUTING)
+            watched = null   // no action ever runs against a cached screen
             val sb = StringBuilder(executedSummary)
             var needsRead = false
             for (a in decision.actions) {
-                if (!running) return
+                if (!running || gen.get() != turnGen) return
                 if (a.t == "stop_live") {
                     // Audit: never keep executing the rest of a stop-turn.
-                    speakIfRunning(app, AlgerianVoice.Phrases.stopAck())
+                    speakIfRunning(app, AlgerianVoice.Phrases.stopAck(), turnGen)
                     stop(app)
                     return
                 }
@@ -468,14 +550,14 @@ object LiveSession {
             executedSummary = sb.toString()
             if (!needsRead) break
         }
-        if (finalSay.isNullOrBlank() && running) {
+        if (finalSay.isNullOrBlank() && running && gen.get() == turnGen) {
             // HONEST fallback — v2.1.0-alpha said the empty «خلصت. توا قولي
             // واش تحب نزيد» here, which looked like nothing happened. Now the
             // user hears the TRUTH: the analysis did not produce a usable
-            // answer, and the correction nudge already ran inside the brain.
+            // answer, and the repair nudge already ran inside the brain.
             finalSay = AlgerianVoice.Phrases.unclear()
             ChatRelay.assistant(app, finalSay)
-            speakIfRunning(app, finalSay)
+            speakIfRunning(app, finalSay, turnGen)
         }
     }
 
@@ -575,6 +657,10 @@ object LiveSession {
                 "read" -> Triple("read", true, "(لقطة جديدة في الجولة التالية)")
                 else -> Triple(a.t, false, "نوع غير معروف")
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // CRITIC FIX #4: cancellation must stay cancellation — swallowing
+            // it here resurrected cancelled turns as fake failures.
+            throw e
         } catch (e: Exception) {
             Triple(a.t, false, "استثناء: ${(e.message ?: e.javaClass.simpleName).take(160)}")
         }

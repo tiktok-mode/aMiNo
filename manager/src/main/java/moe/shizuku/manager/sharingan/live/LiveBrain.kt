@@ -223,6 +223,9 @@ object LiveBrain {
      * FULL SCREEN ANALYSIS on demand (the restored «تحليل الشاشة الكامل»):
      * real pixels → VL model → a plain detailed description. Used by the
      * screen_vision tool in the TYPED chat too — not just live.
+     * CRITIC FIX #10 (team B): failures return an HONEST reason (bad key vs
+     * busy vs HTTP code) — not one flattened message that makes the agent
+     * retry pointlessly against a rejected key.
      */
     fun analyzeFrame(context: android.content.Context, frameB64: String,
                      question: String?): String? {
@@ -246,10 +249,10 @@ object LiveBrain {
                 .put("temperature", 0.2)
                 .put("max_tokens", 2048)
                 .put("stream", false)
-            val (code, raw) = post(creds, body)
+            val (code, raw) = post(creds, body, attempts = 2)
             if (code !in 200..299) {
                 Log.w(TAG, "analyzeFrame HTTP $code")
-                return null
+                return "VISION_ERROR (${httpHint(code, raw)})"
             }
             extractContent(raw)?.trim()?.takeIf { it.isNotBlank() }
         } catch (e: Exception) {
@@ -291,25 +294,42 @@ object LiveBrain {
         persist(context)
     }
 
-    /** Persist the session memory — context SURVIVES stop/start/process death. */
+    /** Persist the session memory — ATOMIC (critic fix #7): tmp+fsync+rename
+     * so a crash mid-write can never truncate the memory to nothing. */
     private fun persist(context: Context) {
         try {
             val f = File(context.filesDir, HISTORY_FILE)
             f.parentFile?.mkdirs()
             val arr = JSONArray()
             synchronized(histLock) { for (m in history) arr.put(m) }
-            f.writeText(arr.toString())
+            val text = arr.toString()
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(text)
+            java.io.FileOutputStream(tmp).channel.force(true)
+            if (!tmp.renameTo(f)) {
+                // same-dir rename is POSIX-atomic; if the FS refused it, fall
+                // back to a direct write rather than losing the memory
+                f.writeText(text)
+                tmp.delete()
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "history persist failed", t)
         }
     }
 
-    /** Reload the session memory on live start (returns true if context resumed). */
+    /** Reload the session memory on live start (returns true if context resumed).
+     * A CORRUPT file (impossible since the atomic persist, but defensive) is
+     * renamed aside instead of silently wiping the memory. */
     fun historyLoad(context: Context): Boolean {
         return try {
             val f = File(context.filesDir, HISTORY_FILE)
             if (!f.exists()) return false
-            val arr = JSONArray(f.readText())
+            val arr = try { JSONArray(f.readText()) } catch (t: Throwable) {
+                Log.w(TAG, "history corrupt — moved aside", t)
+                val bad = File(f.parentFile, f.name + ".corrupt")
+                try { bad.delete(); f.renameTo(bad) } catch (_: Throwable) {}
+                return false
+            }
             val loaded = ArrayList<JSONObject>()
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
@@ -361,10 +381,10 @@ object LiveBrain {
     }
 
     /** POST with retry (429/5xx, 1s/2s backoff) and a max_tokens→max_completion_tokens 400-fallback. */
-    private fun post(creds: LiveKeys.Creds, body: JSONObject): Pair<Int, String> {
+    private fun post(creds: LiveKeys.Creds, body: JSONObject, attempts: Int = 3): Pair<Int, String> {
         var lastCode = -1
         var lastText = ""
-        for (attempt in 0 until 3) {
+        for (attempt in 0 until attempts) {
             val request = Request.Builder()
                 .url("${creds.baseUrl.trimEnd('/')}/chat/completions")
                 .header("Authorization", "Bearer " + String(creds.key))
@@ -397,22 +417,36 @@ object LiveBrain {
             .replace(Regex("^```[a-zA-Z]*\\s*"), "")
             .replace(Regex("\\s*```$"), "")
             .trim()
-        // Candidate scan: the LAST well-formed {...} object wins (audit #6 —
-        // prose may carry multiple braces).
+        // Candidate scan (critic fix #11): STRING-AWARE — braces inside JSON
+        // string values (a `say` echoing a JSON example) used to desync the
+        // depth counter and destroy the real decision object.
         var obj: JSONObject? = null
         var start = -1
         var depth = 0
+        var inString = false
+        var escaped = false
         for (i in cleaned.indices) {
             val c = cleaned[i]
-            if (c == '{') { if (depth == 0) start = i; depth++ }
-            else if (c == '}') {
-                depth--
-                if (depth == 0 && start >= 0) {
-                    val cand = runCatching { JSONObject(cleaned.substring(start, i + 1)) }.getOrNull()
-                    if (cand != null && cand.has("say") || cand != null && cand.has("actions")) {
-                        obj = cand
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    c == '\\' -> escaped = true
+                    c == '"' -> inString = false
+                }
+                continue
+            }
+            when (c) {
+                '"' -> inString = true
+                '{' -> { if (depth == 0) start = i; depth++ }
+                '}' -> {
+                    depth--
+                    if (depth == 0 && start >= 0) {
+                        val cand = runCatching { JSONObject(cleaned.substring(start, i + 1)) }.getOrNull()
+                        if (cand != null && cand.has("say") || cand != null && cand.has("actions")) {
+                            obj = cand
+                        }
+                        start = -1
                     }
-                    start = -1
                 }
             }
         }
