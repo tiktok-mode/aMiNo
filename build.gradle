@@ -27,9 +27,12 @@ subprojects { subproject ->
 }
 
 def gitCommitCount = Integer.parseInt("git rev-list --count HEAD".execute([], project.rootDir).text.trim())
-def baseVersionName = "1.6.0-alpha"  // 1.6.0-alpha (branch feature/sharingan-live): capability REPAIR release — r1421: duplicate 'skill_save' tool spec removed (duplicate function name went to EVERY provider every round; strict gateways 400'd), REAL timeout watchdog in shell_command (dead timeoutMs — streaming commands like logcat locked the agent busy forever), crash-safe atomic skill writes (tmp+fsync+rename), 500ms post-act settle against the screen-transition race, per-task cost log (rounds/toolCalls/screenReads/ms). 1.5.0-alpha base: Sharingan Live panel, memory core, Duration Guardian, single-flight admission (r1414-r1420). Main stays 1.4.2 until merge
+def baseVersionName = "2.1.0-alpha"  // v2.1.0-alpha (gift build): SHARINGAN LIVE V2 — the old structure DELETED (giant panel + OCR recorder); one-tap live session (watch+hear+act), Algerian darija voice in/out (ar-DZ + transcript corrector «تيكت ك»→«تيك توك»), real-frame VL analysis (NVIDIA nemotron VL), Amaterasu black-tears eye overlay, draggable watchdog-protected bubble, live chat relay. Old 1.6.0-alpha: capability repair r1421. Main stays 1.4.2 until merge  // 1.6.0-alpha (branch feature/sharingan-live): capability REPAIR release — r1421: duplicate 'skill_save' tool spec removed (duplicate function name went to EVERY provider every round; strict gateways 400'd), REAL timeout watchdog in shell_command (dead timeoutMs — streaming commands like logcat locked the agent busy forever), crash-safe atomic skill writes (tmp+fsync+rename), 500ms post-act settle against the screen-transition race, per-task cost log (rounds/toolCalls/screenReads/ms). 1.5.0-alpha base: Sharingan Live panel, memory core, Duration Guardian, single-flight admission (r1414-r1420). Main stays 1.4.2 until merge
 def isBeta = project.hasProperty("beta")
+// v2.1.0-alpha: versionCode floor 1440 — the delivered v2.0.0-alpha-r1434 APK had
+// versionCode 1434; a LOWER code makes Android refuse the update install.
+def versionFloor = 1440
 ext {
-    versionCode = gitCommitCount
+    versionCode = Math.max(gitCommitCount, versionFloor)
     versionName = "${baseVersionName}${if (isBeta) "-beta" else ""}"
 }

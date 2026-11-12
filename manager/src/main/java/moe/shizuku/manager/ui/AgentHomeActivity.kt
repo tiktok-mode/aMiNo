@@ -57,13 +57,14 @@ open class AgentHomeActivity : AppActivity() {
             when (mi.itemId) {
                 // 1.5.0-alpha r1412 — THE one-tap Sharingan button (user request:
                 // "زر واحد عند الضغط تظهر اللوحة العائمة"). Uses the CONNECTED
-                // accessibility service as the overlay window token; if the
-                // service is off, guide instead of failing silently.
+                // v2.1.0-alpha — the in-app eye button has THE LIVE ROLE now
+                // (user directive: pressing it = START LIVE, not a service toggle
+                // and not the deleted giant panel). Same behavior as the bubble.
                 R.id.action_sharingan -> {
                     val svc = moe.shizuku.manager.sharingan.SharinganAccessibilityService.instance
                     if (svc != null) {
-                        moe.shizuku.manager.sharingan.SharinganPanel.toggle(svc)
-                        Toast.makeText(this, R.string.sharingan_toast_panel, Toast.LENGTH_SHORT).show()
+                        moe.shizuku.manager.sharingan.live.LiveSession.toggle(svc)
+                        Toast.makeText(this, R.string.sharingan_live_toggle_toast, Toast.LENGTH_SHORT).show()
                     } else {
                         androidx.appcompat.app.AlertDialog.Builder(this)
                             .setTitle(R.string.sharingan_need_enable_title)

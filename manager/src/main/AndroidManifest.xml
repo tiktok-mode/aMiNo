@@ -50,6 +50,10 @@
          setAndAllowWhileIdle and honest "approximately" wording when denied. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <!-- v2.1.0-alpha — SHARINGAN LIVE VOICE: the continuous ear (SpeechRecognizer
+         with ar-DZ) needs RECORD_AUDIO; runtime-granted through
+         SharinganPermissionActivity the first time the eye is tapped. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- aMiNo r1384: Termux handoff for package installs (real detection + RUN_COMMAND;
@@ -295,6 +299,16 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/sharingan_accessibility_service_config" />
         </service>
+
+        <!-- v2.1.0-alpha — LIVE mic permission (one transparent ask, auto-resume).
+             singleTask: repeated eye taps while the dialog is open must not
+             stack duplicate request instances (audit #37). -->
+        <activity
+            android:name=".sharingan.live.SharinganPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:theme="@style/SharinganLiveTranslucent" />
 
         <service
             android:name=".service.WatchdogService"

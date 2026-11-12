@@ -37,8 +37,8 @@ android {
         }
         release {
             signingConfig = signingConfigs.sign
-            minifyEnabled = true
-            shrinkResources = true
+            minifyEnabled = false  // v2.1.0-alpha gift build: R8 minify OOMs the 4GB build sandbox; obfuscation is cosmetic — the live functionality must ship
+            shrinkResources = false  // (paired with minify disable)
             vcsInfo.include = false
             proguardFiles = ["proguard-rules.pro"]
         }

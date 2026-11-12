@@ -58,7 +58,9 @@ object ShizukuExec {
             ?: throw IllegalStateException("Shizuku service binder is not IShizukuService")
     }
 
-    private fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
+    // v2.1.0-alpha: internal (was private) — the live session quotes model-
+    // generated pkg/text args through the SAME proven quoting discipline.
+    internal fun shellQuote(s: String): String = "'" + s.replace("'", "'\\''") + "'"
 
     /**
      * Spawn a long-lived process by the service. In root mode the command is
@@ -140,6 +142,67 @@ object ShizukuExec {
         if (rc != 0 && text.isNotBlank()) Log.w(TAG, "oneShot rc=$rc: ${text.take(200)}")
         Shot(rc, text)
     }
+
+    /**
+     * v2.1.0-alpha — SHARINGAN LIVE VISION: raw BYTES one-shot (same spawn +
+     * watchdog mechanics as [oneShot], but stdout is kept BINARY and capped).
+     * Purpose: `screencap -p` writes the real PNG straight to stdout — the live
+     * session pulls the frame in ONE shell roundtrip (no temp file, no cleanup,
+     * no md5 roundtrip: the hash is computed in-app on the real bytes).
+     * Small-output helper? NO — this is the one sanctioned binary path; text
+     * commands keep using [oneShot] (UTF-8 string semantics).
+     */
+    suspend fun oneShotBytes(command: String, timeoutMs: Long = 15_000,
+                             maxBytes: Int = 8 * 1024 * 1024): Pair<Int, ByteArray> =
+        withContext(Dispatchers.IO) {
+            if (!available()) return@withContext Pair(-1, ByteArray(0))
+            val p = try {
+                spawn(listOf("sh", "-c", command))
+            } catch (e: Throwable) {
+                Log.e(TAG, "oneShotBytes spawn failed", e)
+                return@withContext Pair(-1, ByteArray(0))
+            }
+            val errBuf = java.io.ByteArrayOutputStream()
+            val errT = Thread {
+                try { p.stderr.copyTo(errBuf) } catch (_: Throwable) {}
+            }.apply { isDaemon = true; start() }
+            var timedOut = false
+            val watchdog = Thread {
+                val deadline = System.currentTimeMillis() + timeoutMs
+                try {
+                    while (System.currentTimeMillis() < deadline) {
+                        if (!p.alive()) return@Thread
+                        Thread.sleep(100)
+                    }
+                } catch (_: Throwable) { return@Thread }
+                if (p.alive()) {
+                    timedOut = true
+                    try { p.destroy() } catch (_: Throwable) {}
+                }
+            }.apply { isDaemon = true; start() }
+            val out = java.io.ByteArrayOutputStream(maxBytes.coerceAtMost(4 * 1024 * 1024))
+            var rc = -1
+            try {
+                val buf = ByteArray(64 * 1024)
+                var total = 0
+                while (true) {
+                    val n = p.stdout.read(buf)
+                    if (n < 0) break
+                    if (total + n <= maxBytes) {
+                        out.write(buf, 0, n); total += n
+                    }
+                }
+                rc = p.waitFor()
+            } catch (e: Throwable) {
+                Log.w(TAG, "oneShotBytes io failed", e)
+            } finally {
+                try { watchdog.join(2000) } catch (_: Throwable) {}
+                try { errT.join(1000) } catch (_: Throwable) {}
+                try { p.destroy() } catch (_: Throwable) {}
+            }
+            if (timedOut) rc = -1
+            Pair(rc, out.toByteArray())
+        }
 
     /**
      * Stream a local file into a remote path through the service

@@ -122,6 +122,16 @@
         <item name="android:windowNoTitle">true</item>
     </style>
 
+    <!-- v2.1.0-alpha — LIVE mic permission ask: fully transparent, no dimming,
+         no animation; the user sees their current screen and just the dialog. -->
+    <style name="SharinganLiveTranslucent" parent="Theme.Material3Expressive.DayNight.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
+
     <style name="Preference.Rikka.Material3.Empty" parent="@style/Preference.Rikka.Material3">
         <item name="layout">@layout/preference_empty</item>
     </style>
