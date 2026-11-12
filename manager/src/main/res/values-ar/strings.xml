@@ -414,7 +414,6 @@
     <string name="agent_stop">إيقاف</string>
     <string name="agent_new_chat">محادثة جديدة</string>
     <string name="agent_err_no_key">لا يوجد مفتاح API. افتح صفحة المفاتيح وأضف واحداً.</string>
-    <string name="agent_err_tool_rounds">خطوات أدوات كثيرة جداً لمهمة واحدة — أوقفتها للسلامة.</string>
     <string name="agent_err_network">خطأ شبكة: %1$s</string>
     <string name="agent_err_internal">خطأ داخلي: %1$s</string>
     <string name="agent_cancelled_note">⏹ أُلغي التنفيذ بناءً على طلبك.</string>

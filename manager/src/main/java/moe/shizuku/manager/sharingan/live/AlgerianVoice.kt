@@ -150,5 +150,6 @@ object AlgerianVoice {
         fun executedFail(action: String) = "الأمر $action ما مشاش."
         fun stopAck() = "خلاص، نوقف."
         fun hearNothing() = "ما فهمتكش، عاود قولها بشوية."
+        fun unclear() = "ما قدرتش ننفذ هذا الأمر توا، عاود قولو ليّا."
     }
 }

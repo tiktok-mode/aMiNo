@@ -1,6 +1,10 @@
 pluginManagement {
     repositories {
         google()
+        // Mirror of Maven Central hosted by Google — Maven Central itself
+        // rate-limits (HTTP 429) builds from this sandbox; the mirror is
+        // identical content. Kept AFTER google() and BEFORE mavenCentral.
+        maven { url = "https://maven-central.storage-download.googleapis.com/maven2/" }
         mavenLocal()
         mavenCentral()
         maven {
@@ -22,6 +26,8 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
+        // Maven Central mirror (Google) — see pluginManagement note above.
+        maven { url = "https://maven-central.storage-download.googleapis.com/maven2/" }
         mavenLocal()
         mavenCentral()
         maven {

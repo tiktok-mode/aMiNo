@@ -420,13 +420,34 @@ object ToolRegistry {
             ToolSpec(
                 "screen_capture",
                 "Take a REAL full-screen PNG (screencap through the aMiNo service) and return its on-device " +
-                    "path (/data/local/tmp, last 5 kept). The PNG is for the USER or future vision models — " +
-                    "this version has no OCR: to READ the screen yourself use screen_read instead.",
+                    "path (/data/local/tmp, last 5 kept). The PNG is for the USER — to READ the screen " +
+                    "yourself use screen_read (fast text/element tree) or screen_vision (real visual analysis).",
                 JSONObject().put("type", "object").put("properties", JSONObject())
             ),
             requiresShell = false
         ) { _, _ ->
             runBlocking { moe.shizuku.manager.agent.perception.ScreenPerception.capture() }
+        },
+        RegisteredTool(
+            ToolSpec(
+                "screen_vision",
+                "FULL VISUAL SCREEN ANALYSIS (v2.2.0 — the restored screen-partage analysis): captures the " +
+                    "CURRENT screen as REAL PIXELS (screencap -> JPEG) and sends the actual IMAGE to the " +
+                    "vision-language model, which returns a detailed honest description — app/activity on " +
+                    "screen, readable titles and texts, buttons and elements, images/video content, screen " +
+                    "state (locked? dialog? playing?). This sees what screen_read CANNOT: pixel-only content " +
+                    "(photos, videos, images, canvas UIs). Use it whenever the user asks WHAT IS ON THE " +
+                    "SCREEN / to analyze the display, or when screen_read found no useful text. Optional " +
+                    "question focuses the analysis. Requires the aMiNo service (Shizuku) and the live-brain " +
+                    "vision endpoint.",
+                JSONObject().put("type", "object").put("properties",
+                    JSONObject().put("question", JSONObject()
+                        .put("type", "string")
+                        .put("description", "Optional specific question about the screen, e.g. 'what error is shown?'")))
+            ),
+            requiresShell = false
+        ) { ctx, args ->
+            runBlocking { moe.shizuku.manager.agent.perception.ScreenPerception.vision(ctx, args) }
         },
 
         // ============ v1.3 SUPER AGENT: SKILL ENGINE (Explore -> Learn -> Store -> Reuse) ============

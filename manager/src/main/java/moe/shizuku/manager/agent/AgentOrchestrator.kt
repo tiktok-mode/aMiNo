@@ -61,10 +61,14 @@ data class AgentUiState(
 object AgentOrchestrator {
 
     private const val TAG = "AgentOrchestrator"
-    // v1.3: GUI tasks (screen_read -> screen_act -> screen_read verify cycles) need
-    // more rounds than pure shell tasks — 12 keeps perception/skill workflows in one run.
-    private const val MAX_TOOL_ROUNDS = 12
-    private const val HISTORY_LIMIT = 12
+    // v2.2.0-alpha — THE 12-ROUND SAFETY STOP IS GONE (user directive,
+    // verbatim: «افتح قيود التي تفرضها عند وضع كثير من الأوامر… ⚠️ Trop
+    // d'étapes d'outils — لا أريده أن يتوقف ثم ينسى السياق، دعه مفتوحاً حتى
+    // أوقفه أنا يدوياً»). The loop now runs UNTIL the model declares the task
+    // done OR the user presses stop — the one and only stop is the user's.
+    // A long-run honest perf line still lands in Logcat every 25 rounds so
+    // runaway loops are observable without limiting them.
+    private const val HISTORY_LIMIT = 40
 
     private val guard = CoroutineExceptionHandler { _, e ->
         Log.e(TAG, "uncaught agent error", e)
@@ -520,14 +524,10 @@ object AgentOrchestrator {
                         return
                     }
                     is LlmDecision.ToolCalls -> {
-                        if (round >= MAX_TOOL_ROUNDS) {
-                            MemoryRepository.addMessage(context, convId, "assistant",
-                                "⚠️ " + context.getString(R.string.agent_err_tool_rounds))
-                            MemoryRepository.saveWorking(context, convId, userText, steps.toString(), "error")
-                            publish(context, convId, AgentStatus.Ready)
-                            return
-                        }
                         round++
+                        if (round % 25 == 0) {
+                            Log.i(TAG, "long task: $round tool rounds (runs until done or user stop)")
+                        }
                         for (call in decision.calls) {
                             if (cancelled) { saveCancelled(context, convId, steps); return }
                             executeToolCall(context, convId, call, steps)

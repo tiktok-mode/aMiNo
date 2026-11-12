@@ -18,12 +18,12 @@ import moe.shizuku.manager.terminal.linux.ShizukuExec
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * v2.1.0-alpha — SHARINGAN LIVE SESSION (the Gemini-Like core).
+ * v2.2.0-alpha — SHARINGAN LIVE SESSION (the Gemini-Like core).
  *
- * ONE TAP on the red eye = this session starts. No record button, no send
- * button, no giant panel (the old SharinganPanel is deleted) — the flow is
- * exactly what the user asked, verbatim: «اترك فقط live watching لتسمع الكلام
- * مباشرة وتنفذ وتتكلم وتحلل الصورة كما هي ولا تعتمد فقط على ocr».
+ * ONE TAP on the side eye = this session starts. No record button, no send
+ * button, no giant panel — and since v2.2.0-alpha exactly ONE eye on screen
+ * (the side bubble carries the whole Amaterasu look; LiveEyeOverlay is
+ * DELETED — «الكثير من العيون بدون فائدة، نريد الجانبية التي تشبه Gemini»).
  *
  * Per heard utterance:
  *   1. Echo gate: finals spoken while the assistant ITSELF is speaking (and a
@@ -33,12 +33,19 @@ import java.util.concurrent.atomic.AtomicInteger
  *      stop-command check runs BEFORE the network roundtrip.
  *   3. The row lands in the CHAT (ChatRelay) — nothing is ever silent.
  *   4. LiveVision captures the REAL screen pixels (screencap→PNG→JPEG).
+ *      NEW — IDLE WATCH: while LISTENING a fresh frame is captured every ~4s
+ *      (md5-gated freshness) so the turn that follows starts from the
+ *      FRESHEST possible screen with near-zero latency — the eye truly
+ *      watches continuously like Gemini, not only at speech time.
  *   5. LiveBrain sees the frame + reads the corrected command → JSON
  *      {say, actions, done}; say is SPOKEN FIRST (hands-disabled user).
+ *      NEW — SESSION MEMORY: decisions ride a persisted multi-turn history
+ *      (filesDir/sharingan/live_history.json) — the eye RESUMES its context
+ *      after stop/start («لا أريده أن يتوقف ثم ينسى السياق»).
  *   6. Actions execute through the real shell, each with an honest chat row.
  *      Destructive shell patterns are DENIED outright (no hands to confirm).
- *   7. `read` actions pull a FRESH frame (max 3 rounds) → the brain sees the
- *      RESULT of its own actions (visual verification).
+ *   7. `read` actions pull a FRESH frame (max 8 rounds — the old 3 could
+ *      abort mid-GUI-task) → the brain sees the RESULT of its own actions.
  *   8. The ear NEVER stops: barge-in partials kill the TTS mid-sentence.
  *
  * Concurrency: the turn admission is a synchronized check-and-set
@@ -51,7 +58,7 @@ object LiveSession {
     private const val TAG = "LiveSession"
 
     // ---------- state ----------
-    @Volatile var phase: LiveEyeOverlay.LivePhase = LiveEyeOverlay.LivePhase.LISTENING
+    @Volatile var phase: LivePhase = LivePhase.LISTENING
         private set
     @Volatile var running: Boolean = false
         private set
@@ -84,6 +91,12 @@ object LiveSession {
     // Echo gate: the assistant must never hear itself (speakerphone loop).
     @Volatile private var lastTtsDoneAt: Long = 0
     private val echoTailMs = 600L
+
+    // IDLE WATCH: the freshest frame captured while LISTENING (Gemini-like
+    // continuous watching; the turn consumes it if still fresh).
+    @Volatile private var watchedFrame: LiveVision.Frame? = null
+    @Volatile private var watchedAt: Long = 0L
+    private val watchFreshMs = 8_000L
 
     @Volatile private var sessionContext: Context? = null
 
@@ -144,14 +157,15 @@ object LiveSession {
         pendingUtterance = null
         enterListening()
 
-        // 3) The Amaterasu eye — ONLY during live, through the SERVICE's
-        //    WindowManager (TYPE_ACCESSIBILITY_OVERLAY is tied to the
-        //    accessibility privilege — the proven r1414 path).
-        val svcCtx = moe.shizuku.manager.sharingan.SharinganAccessibilityService.instance ?: app
-        main.post {
-            if (gen.get() != myGen) return@post
-            LiveEyeOverlay.show(svcCtx)
+        // SESSION MEMORY: reload what the previous live session remembered —
+        // the context is never thrown away by a stop.
+        val resumed = try { LiveBrain.historyLoad(app) } catch (_: Throwable) { false }
+        if (resumed) {
+            ChatRelay.note(app, "👁 رجعنا البث — ذاكرة السياق مستأنفة (${LiveBrain.historySize()} رسالة من الجلسة السابقة).")
         }
+
+        // THE ONE EYE — the side bubble carries the whole live look now
+        // (Amaterasu tears + phase breathing). No second window anywhere.
         SharinganBubble.setLiveMode(true)
 
         ChatRelay.note(app, "👁‍🗨 الشارينغان لايف بدا — قول أي أمر بالدارجة، ونفسي نفّذ وأتحقق. ضغطة على العين توقف البث.")
@@ -168,7 +182,7 @@ object LiveSession {
                 // Utterance finished → back to listening + arm the echo tail.
                 AlgerianVoice.onUtteranceDone = {
                     lastTtsDoneAt = System.currentTimeMillis()
-                    if (running && phase == LiveEyeOverlay.LivePhase.SPEAKING) enterListening()
+                    if (running && phase == LivePhase.SPEAKING) enterListening()
                 }
                 bootEar(app, myGen)
             }
@@ -184,11 +198,35 @@ object LiveSession {
         val sc = scope ?: return
         turnJob = sc.launch {
             try {
-                greetingTurn(app)
+                greetingTurn(app, resumed)
                 drainQueue(app)
             } finally {
                 synchronized(turnLock) { turnBusy = false }
                 if (running) enterListening()
+            }
+        }
+
+        // IDLE WATCH loop — continuous Gemini-style watching: while the
+        // session is idle (LISTENING, no turn running) it keeps the freshest
+        // frame ready, so the next spoken command is answered from a screen
+        // captured SECONDS ago (md5-freshness, no burn-in of old frames).
+        val watcherGen = myGen
+        sc.launch {
+            while (running && gen.get() == watcherGen) {
+                val idle = synchronized(turnLock) { !turnBusy } &&
+                    phase == LivePhase.LISTENING
+                if (idle) {
+                    try {
+                        val f = LiveVision.captureFrame(app)
+                        if (f != null && gen.get() == watcherGen) {
+                            watchedFrame = f
+                            watchedAt = System.currentTimeMillis()
+                        }
+                    } catch (_: Throwable) {}
+                    kotlinx.coroutines.delay(4_000)
+                } else {
+                    kotlinx.coroutines.delay(1_200)
+                }
             }
         }
     }
@@ -200,7 +238,7 @@ object LiveSession {
             onFinal = { text -> onUtterance(text) },
             onPartialBargeIn = {
                 // BARGE-IN: any real partial speech while speaking → stop TTS.
-                if (phase == LiveEyeOverlay.LivePhase.SPEAKING && AlgerianVoice.isSpeaking) {
+                if (phase == LivePhase.SPEAKING && AlgerianVoice.isSpeaking) {
                     AlgerianVoice.stop()
                     enterListening()
                 }
@@ -222,10 +260,9 @@ object LiveSession {
         if (!running) return
         running = false
         val myGen = gen.incrementAndGet()   // every async callback is now stale
-        phase = LiveEyeOverlay.LivePhase.LISTENING
+        phase = LivePhase.LISTENING
         main.post {
             ear?.stop(); ear = null
-            LiveEyeOverlay.hide()
         }
         SharinganBubble.setLiveMode(false)
         AlgerianVoice.stop()
@@ -247,19 +284,19 @@ object LiveSession {
     fun stopIfRunning(context: Context) = stop(context)
 
     private fun enterListening() {
-        phase = LiveEyeOverlay.LivePhase.LISTENING
-        main.post { LiveEyeOverlay.setPhase(phase) }
+        phase = LivePhase.LISTENING
+        main.post { SharinganBubble.setPhase(phase) }
     }
 
-    private fun enterPhase(p: LiveEyeOverlay.LivePhase) {
+    private fun enterPhase(p: LivePhase) {
         phase = p
-        main.post { LiveEyeOverlay.setPhase(p) }
+        main.post { SharinganBubble.setPhase(p) }
     }
 
     // ---------- turns ----------
 
-    private suspend fun greetingTurn(app: Context) {
-        enterPhase(LiveEyeOverlay.LivePhase.THINKING)
+    private suspend fun greetingTurn(app: Context, resumed: Boolean) {
+        enterPhase(LivePhase.THINKING)
         val frame = LiveVision.captureFrame(app) ?: run {
             ChatRelay.note(app, "⚠️ ما نجملت لقطة الشاشة — تحقق من خدمة الشيل.")
             speakIfRunning(app, AlgerianVoice.Phrases.frameFail())
@@ -267,13 +304,11 @@ object LiveSession {
             return
         }
         val system = LiveBrain.systemPrompt(app, frame.realW, frame.realH, frame.analysisH)
-        val decision = LiveBrain.vision(
-            app,
-            system,
-            "البث بدا توّا. قدّم نفسك بجملة قصيرة بالدارجة وصف وشاشة المستخدم توا (شنو يبان فعلاً). done=true, actions=[].",
-            "",
-            frame.b64Jpeg
-        )
+        val instruction = if (resumed)
+            "البث رجع بعد توقف — ذاكرة الجلسة السابقة موجودة في الرسائل السابقة، استعملها مع الأوامر الجديدة. قدّم نفسك بجملة قصيرة بالدارجة وصف وشاشة المستخدم توا (شنو يبان فعلاً). done=true, actions=[]."
+        else
+            "البث بدا توّا. قدّم نفسك بجملة قصيرة بالدارجة وصف وشاشة المستخدم توا (شنو يبان فعلاً). done=true, actions=[]."
+        val decision = LiveBrain.vision(app, system, instruction, "", frame.b64Jpeg)
         val say = decision.say.ifBlank { AlgerianVoice.Phrases.started() }
         ChatRelay.assistant(app, "👁 $say")
         speakIfRunning(app, say)
@@ -292,7 +327,7 @@ object LiveSession {
         // ECHO GATE (expert audit CRITICAL #4/#49): finals while the assistant
         // is speaking are its own voice on the speakerphone — never transcribe
         // yourself, never execute your own words. Plus a tail window after.
-        if (phase == LiveEyeOverlay.LivePhase.SPEAKING) return
+        if (phase == LivePhase.SPEAKING) return
         if (System.currentTimeMillis() - lastTtsDoneAt < echoTailMs) return
 
         val app = sessionContext ?: return
@@ -355,12 +390,12 @@ object LiveSession {
     /** Speak only if the session is still alive (no zombie speech after stop). */
     private suspend fun speakIfRunning(app: Context, text: String) {
         if (!running) return
-        enterPhase(LiveEyeOverlay.LivePhase.SPEAKING)
+        enterPhase(LivePhase.SPEAKING)
         AlgerianVoice.speak(text)
     }
 
     private suspend fun executeTurn(app: Context, rawVoice: String) {
-        enterPhase(LiveEyeOverlay.LivePhase.THINKING)
+        enterPhase(LivePhase.THINKING)
         ChatRelay.beginTurn(app)
 
         // 0) Raw stop-command fast path BEFORE the network roundtrip.
@@ -377,13 +412,19 @@ object LiveSession {
         val (corrected, usedNet) = TranscriptCorrector.correct(app, rawVoice)
         ChatRelay.user(app, corrected, rawVoice, localFix = !usedNet)
 
-        // 2) Watch-hear-act loop (max 3 vision rounds per utterance).
+        // 2) Watch-hear-act loop (max 8 vision rounds per utterance — GUI
+        //    tasks like «افتح... وانتظر... ثم أخبرني» need launch→wait→read→
+        //    describe chains; the old 3 aborted them mid-task).
         var executedSummary = ""
         var finalSay: String? = null
-        for (round in 1..3) {
+        for (round in 1..8) {
             if (!running) return
-            enterPhase(LiveEyeOverlay.LivePhase.THINKING)
-            val frame = LiveVision.captureFrame(app)
+            enterPhase(LivePhase.THINKING)
+            // The idle watch keeps a FRESH frame ready — use it when young
+            // (Gemini-like continuity), otherwise capture now.
+            val frame = watchedFrame?.takeIf {
+                System.currentTimeMillis() - watchedAt < watchFreshMs
+            } ?: LiveVision.captureFrame(app)
             if (frame == null) {
                 finalSay = AlgerianVoice.Phrases.frameFail()
                 ChatRelay.note(app, "⚠️ فشل التقاط الإطار (الشيل طاح؟)")
@@ -408,7 +449,7 @@ object LiveSession {
             if (decision.actions.isEmpty() || decision.done) break
 
             // 4) Execute actions through the REAL shell, honest rows in chat.
-            enterPhase(LiveEyeOverlay.LivePhase.EXECUTING)
+            enterPhase(LivePhase.EXECUTING)
             val sb = StringBuilder(executedSummary)
             var needsRead = false
             for (a in decision.actions) {
@@ -428,7 +469,11 @@ object LiveSession {
             if (!needsRead) break
         }
         if (finalSay.isNullOrBlank() && running) {
-            finalSay = "خلصت. توا قولي واش تحب نزيد."
+            // HONEST fallback — v2.1.0-alpha said the empty «خلصت. توا قولي
+            // واش تحب نزيد» here, which looked like nothing happened. Now the
+            // user hears the TRUTH: the analysis did not produce a usable
+            // answer, and the correction nudge already ran inside the brain.
+            finalSay = AlgerianVoice.Phrases.unclear()
             ChatRelay.assistant(app, finalSay)
             speakIfRunning(app, finalSay)
         }

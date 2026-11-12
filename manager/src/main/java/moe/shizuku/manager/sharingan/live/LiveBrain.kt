@@ -1,5 +1,6 @@
 package moe.shizuku.manager.sharingan.live
 
+import android.content.Context
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -7,27 +8,44 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * v2.1.0-alpha — THE LIVE BRAIN: multimodal chat against the configured
- * vision endpoint ([LiveKeys]).
+ * v2.2.0-alpha — THE LIVE BRAIN: fixed, remembering, reusable.
  *
- * Validated against the real NVIDIA integrate endpoint before shipping
- * (scripts/test_live_pipeline.py): image_url with a base64 data URI, strict
- * JSON answer, Algerian-darija `say`, executable `actions`.
+ * FIELD-PROVEN CRITICAL FIX (sandbox test test_v22_fix.py against the real
+ * NVIDIA endpoint, 2026-11-13): v2.1.0-alpha passed the RAW chat-completions
+ * ENVELOPE to parseDecision. The model answers with perfect JSON inside
+ * `content` — but inside the envelope that JSON arrives ESCAPED, the balanced
+ * brace scan can never rebuild it, so vision() returned say="" + no actions
+ * and every spoken command degraded to the empty «خلصت…» chat row with
+ * NOTHING executed (the user's exact complaint: «لايف يحول يفهم كلامي لكن
+ * ما يطبق الأوامر ولا يتفاعل، فقط يحول الكلام إلى دردشة»). The sandbox run
+ * proved it: parse(raw envelope) == None, parse(extractContent(raw)) ==
+ * full decision with launch tiktok + wait + read. extractContent() now runs
+ * FIRST (content, with the reasoning_content salvage), and parseDecision
+ * sees the model's actual text.
  *
- * Expert-audit hardened:
- *  - per-request callTimeout(45s) — a wedged endpoint can never freeze a turn
- *    for the shared client's 120s read window (audit #8/#27);
- *  - 429/5xx retried with 1s/2s backoff instead of killing the turn (audit #2);
- *  - reasoning models: empty `content` is salvaged from `reasoning_content`'s
- *    last JSON-looking object (audit #3), and a 400 that names `max_tokens`
- *    is retried once with `max_completion_tokens` (audit #4);
- *  - `say`/`cmd` "null"-string and brace-contaminated text are neutralized
- *    (audit #5/#6) before anything is spoken or executed;
- *  - fence stripping is regex-based, tolerant of ```JSON / ```text (audit #7);
- *  - the prompt carries the CONCRETE analysis height and the volume keys.
+ * SESSION MEMORY (the «ينسى السياق» fix): the brain keeps a rolling
+ * multi-turn history — every user instruction and every assistant decision
+ * (TEXT ONLY, images never stored) — capped and persisted to
+ * filesDir/sharingan/live_history.json after every turn and reloaded on
+ * start(), so the eye RESUMES its context after stop/start, exactly as the
+ * user demanded («لا أريده أن يتوقف ثم ينسى السياق»).
+ *
+ * REPAIR RETRY: a non-JSON answer gets ONE strict repair nudge inside the
+ * same conversation before anything is spoken — an unusable decision can
+ * never again surface as a silent empty row.
+ *
+ * analyzeFrame() exposes the same real-pixel VL path as a plain text answer
+ * — it powers the restored FULL screen analysis tool (screen_vision) the
+ * user asked to bring back («رجّع تحليل الشاشة الكامل»).
+ *
+ * Kept from v2.1.0-alpha (expert-audit hardened): per-request callTimeout
+ * 45s, 429/5xx retry with 1s/2s backoff, reasoning-model salvage, the
+ * max_tokens→max_completion_tokens 400-fallback, fence stripping, brace
+ * scanning, "null"-string neutralization.
  */
 object LiveBrain {
 
@@ -39,6 +57,12 @@ object LiveBrain {
         moe.shizuku.manager.agent.OpenAiCompatProvider.client.newBuilder()
             .callTimeout(45, TimeUnit.SECONDS)
             .build()
+
+    // ---------- session memory (context survives stop/start) ----------
+    private const val HISTORY_MAX = 16          // messages (8 user+assistant pairs)
+    private const val HISTORY_FILE = "sharingan/live_history.json"
+    private val histLock = Any()
+    private val history = ArrayList<JSONObject>()
 
     data class Action(
         val t: String,           // shell | launch | tap | text | key | wait | read | stop_live
@@ -64,6 +88,7 @@ object LiveBrain {
         appendLine("أنت «عين AMINO» — عين الشارينغان في بث مباشر (LIVE) على هاتف المستخدم.")
         appendLine("ترى الشاشة الحقيقية في الصورة المرفقة (بكسل حقيقي: ألوان، صور، فيديو، واجهات)، وتسمع كلام المستخدم باللهجة الجزائرية، وتقدر تنفذ أوامر حقيقية.")
         appendLine("المستخدم يتحكم بالصوت فقط (يديه معطلة) — لا تطلب منه أبداً أن يكتب أو يضغط شيئاً؛ نفّذ أنت كل شيء.")
+        appendLine("الرسائل السابقة في هذه المحادثة (إن وُجدت) هي ذاكرة الجلسة الحقيقية — استعملها لتفهم «وينسى السياق» أبداً.")
         appendLine()
         appendLine("قواعد صارمة:")
         appendLine("- كلم المستخدم باللهجة الجزائرية الدارجة بالحروف العربية، قصير ونافع (كلامك يُنطق بصوت TTS): بدون رموز، بدون ماركداون، بدون قوائم.")
@@ -87,6 +112,9 @@ object LiveBrain {
 
     /**
      * One vision round: frame + instruction + executed-so-far summary → decision.
+     * Multi-turn aware: the session history rides along as text messages and
+     * THIS turn's exchange is appended on success (never on failure — a
+     * broken turn must not poison the memory).
      * Returns Decision even on protocol hiccups (say = honest error text).
      */
     fun vision(
@@ -106,30 +134,64 @@ object LiveBrain {
                     appendLine("اللقطة المرفقة هي الحالة الحالية بعد التنفيذ — واصل أو أنهي بحسب ما تراه.")
                 }
             }
-            val messages = JSONArray()
-                .put(JSONObject().put("role", "system").put("content", system))
-                .put(JSONObject().put("role", "user").put("content", JSONArray()
-                    .put(JSONObject().put("type", "text").put("text", userText))
-                    .put(JSONObject().put("type", "image_url").put("image_url",
-                        JSONObject().put("url", "data:image/jpeg;base64,$frameB64")))))
-            val body = JSONObject()
-                .put("model", creds.model)
-                .put("messages", messages)
-                .put("temperature", 0.2)
-                .put("max_tokens", 2048)
-                .put("stream", false)
-            val (code, text) = post(creds, body)
-            if (code !in 200..299) {
-                return Decision(
-                    say = "راني ما نقدرش نتواصل مع العقل الآن (${httpHint(code, text)})",
-                    actions = emptyList(), done = true, rawValidJson = false)
+            val messages = JSONArray().put(
+                JSONObject().put("role", "system").put("content", system))
+            synchronized(histLock) { for (m in history) messages.put(m) }
+            val userMsg = JSONObject().put("role", "user").put("content", JSONArray()
+                .put(JSONObject().put("type", "text").put("text", userText))
+                .put(JSONObject().put("type", "image_url").put("image_url",
+                    JSONObject().put("url", "data:image/jpeg;base64,$frameB64"))))
+            messages.put(userMsg)
+
+            var decision = requestDecision(creds, messages, 4096)
+
+            // REPAIR RETRY: one strict nudge inside the SAME conversation —
+            // a non-JSON answer never becomes a silent empty row again.
+            if (!decision.rawValidJson && decision.actions.isEmpty() && decision.say.isBlank()) {
+                Log.w(TAG, "unusable decision — one repair retry")
+                val repair = JSONArray()
+                for (i in 0 until messages.length()) repair.put(messages.optJSONObject(i))
+                repair.put(JSONObject().put("role", "assistant")
+                    .put("content", "لست متأكداً من الصيغة"))
+                repair.put(JSONObject().put("role", "user").put("content",
+                    "ردّك السابق لم يكن JSON صالحاً. أعد الإجابة الآن: JSON فقط بالصيغة " +
+                    "{\"say\":\"...\",\"actions\":[...],\"done\":true} بدون أي نص آخر."))
+                val repaired = requestDecision(creds, repair, 2048)
+                if (repaired.rawValidJson || repaired.say.isNotBlank()) decision = repaired
             }
-            parseDecision(text, creds)
+
+            // MEMORY: remember THIS exchange (text only) on a usable decision.
+            if (decision.rawValidJson) {
+                remember(context, userText, decision)
+            }
+            decision
         } catch (e: Exception) {
             Log.e(TAG, "vision failed", e)
             Decision(say = "صرات مشكلة في التحليل، عاود قول الأمر.",
                 actions = emptyList(), done = true, rawValidJson = false)
         }
+    }
+
+    /** POST + extractContent FIRST (the critical fix) + parse. */
+    private fun requestDecision(creds: LiveKeys.Creds, messages: JSONArray,
+                                maxTokens: Int): Decision {
+        val body = JSONObject()
+            .put("model", creds.model)
+            .put("messages", messages)
+            .put("temperature", 0.2)
+            .put("max_tokens", maxTokens)
+            .put("stream", false)
+        val (code, raw) = post(creds, body)
+        if (code !in 200..299) {
+            return Decision(
+                say = "راني ما نقدرش نتواصل مع العقل الآن (${httpHint(code, raw)})",
+                actions = emptyList(), done = true, rawValidJson = false)
+        }
+        // THE FIX: pull the model's message content out of the envelope FIRST,
+        // then parse — never parse the envelope itself. Null content parses as
+        // "" → the vision() repair-retry path handles it honestly.
+        val content = extractContent(raw) ?: ""
+        return parseDecision(content, creds)
     }
 
     /** Plain text call (transcript correction + short utilities). */
@@ -156,6 +218,119 @@ object LiveBrain {
             null
         }
     }
+
+    /**
+     * FULL SCREEN ANALYSIS on demand (the restored «تحليل الشاشة الكامل»):
+     * real pixels → VL model → a plain detailed description. Used by the
+     * screen_vision tool in the TYPED chat too — not just live.
+     */
+    fun analyzeFrame(context: android.content.Context, frameB64: String,
+                     question: String?): String? {
+        val sys = buildString {
+            appendLine("أنت محلل شاشة أندرويد. ترى الصورة المرفقة (لقطة شاشة حقيقية بالبكسل).")
+            appendLine("صِف بدقة ما تراه: التطبيق/النشاط الظاهر، العناوين والنصوص المقروءة فعلاً، الأزرار والعناصر، حالة الشاشة (مقفلة؟ حوار؟ تشغيل فيديو؟).")
+            appendLine("إن سُئلت سؤالاً محدداً أجب عنه من الصورة. إن لم تجرؤ على قراءة شيء قل ذلك بصدق — لا تخترع أبداً.")
+            appendLine("الجواب نص عادي مفيد (10 أسطر كحد أقصى)، بدون ماركداون وبدون JSON.")
+        }
+        val q = question?.takeIf { it.isNotBlank() } ?: "صِف هذه الشاشة بالتفصيل المفيد."
+        val creds = LiveKeys.creds(context)
+        return try {
+            val body = JSONObject()
+                .put("model", creds.model)
+                .put("messages", JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", sys))
+                    .put(JSONObject().put("role", "user").put("content", JSONArray()
+                        .put(JSONObject().put("type", "text").put("text", q))
+                        .put(JSONObject().put("type", "image_url").put("image_url",
+                            JSONObject().put("url", "data:image/jpeg;base64,$frameB64"))))))
+                .put("temperature", 0.2)
+                .put("max_tokens", 2048)
+                .put("stream", false)
+            val (code, raw) = post(creds, body)
+            if (code !in 200..299) {
+                Log.w(TAG, "analyzeFrame HTTP $code")
+                return null
+            }
+            extractContent(raw)?.trim()?.takeIf { it.isNotBlank() }
+        } catch (e: Exception) {
+            Log.w(TAG, "analyzeFrame failed", e)
+            null
+        }
+    }
+
+    // ---------- session memory internals ----------
+
+    private fun remember(context: Context, userText: String, d: Decision) {
+        val actionsArr = JSONArray()
+        for (a in d.actions) {
+            val o = JSONObject().put("t", a.t)
+            if (!a.cmd.isNullOrBlank()) o.put("cmd", a.cmd!!.take(160))
+            if (!a.pkg.isNullOrBlank()) o.put("pkg", a.pkg!!)
+            if (a.x != null) o.put("x", a.x)
+            if (a.y != null) o.put("y", a.y)
+            if (!a.s.isNullOrBlank()) o.put("s", a.s!!.take(120))
+            if (!a.k.isNullOrBlank()) o.put("k", a.k!!)
+            if (a.ms != null) o.put("ms", a.ms)
+            actionsArr.put(o)
+        }
+        val compact = JSONObject()
+            .put("say", d.say)
+            .put("actions", actionsArr)
+            .put("done", d.done)
+        synchronized(histLock) {
+            history.add(JSONObject().put("role", "user").put("content", userText.take(600)))
+            history.add(JSONObject().put("role", "assistant")
+                .put("content", compact.toString()))
+            // pair-aware cap: never open the window on an assistant message
+            while (history.size > HISTORY_MAX) {
+                history.removeAt(0)
+                if (history.isNotEmpty() && history.first().optString("role") == "assistant")
+                    history.removeAt(0)
+            }
+        }
+        persist(context)
+    }
+
+    /** Persist the session memory — context SURVIVES stop/start/process death. */
+    private fun persist(context: Context) {
+        try {
+            val f = File(context.filesDir, HISTORY_FILE)
+            f.parentFile?.mkdirs()
+            val arr = JSONArray()
+            synchronized(histLock) { for (m in history) arr.put(m) }
+            f.writeText(arr.toString())
+        } catch (t: Throwable) {
+            Log.w(TAG, "history persist failed", t)
+        }
+    }
+
+    /** Reload the session memory on live start (returns true if context resumed). */
+    fun historyLoad(context: Context): Boolean {
+        return try {
+            val f = File(context.filesDir, HISTORY_FILE)
+            if (!f.exists()) return false
+            val arr = JSONArray(f.readText())
+            val loaded = ArrayList<JSONObject>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val role = o.optString("role")
+                val content = o.optString("content")
+                if ((role == "user" || role == "assistant") && content.isNotBlank())
+                    loaded.add(JSONObject().put("role", role).put("content", content))
+            }
+            synchronized(histLock) {
+                history.clear()
+                history.addAll(loaded.takeLast(HISTORY_MAX))
+            }
+            history.isNotEmpty()
+        } catch (t: Throwable) {
+            Log.w(TAG, "history load failed", t)
+            false
+        }
+    }
+
+    /** Count of remembered exchanges (for the honest resume note). */
+    fun historySize(): Int = synchronized(histLock) { history.size }
 
     /** Pull the final answer out of a chat-completions response (reasoning-aware). */
     private fun extractContent(raw: String): String? {

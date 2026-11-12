@@ -228,8 +228,8 @@ object ScreenPerception {
 
     /**
      * Full-screen PNG via `screencap` (no MediaProjection prompt needed from the
-     * shell uid). The file stays on the device for the user / future vision models;
-     * only the 5 newest are kept.
+     * shell uid). The file stays on the device for the user; only the 5 newest
+     * are kept.
      */
     suspend fun capture(): AgentTools.ToolResult {
         if (!serviceReady()) return unavailable()
@@ -240,8 +240,37 @@ object ScreenPerception {
         ShizukuExec.oneShot("ls -t $SCREEN_GLOB 2>/dev/null | tail -n +6 | xargs rm -f 2>/dev/null", 10_000)
         return AgentTools.ToolResult(
             true,
-            "screenshot saved on device: $p (PNG, kept in /data/local/tmp — v1.3 has no OCR; " +
-                "use screen_read for the text/element view)"
+            "screenshot saved on device: $p (PNG, kept in /data/local/tmp — " +
+                "use screen_vision to SEE it yourself or screen_read for the text/element view)"
         )
+    }
+
+    // ----------------------------------------------------------------- vision
+
+    /**
+     * v2.2.0-alpha — RESTORED FULL SCREEN ANALYSIS (user, verbatim: «مميزات
+     * سكرين بارتاج تم حذفها… رجّع تحليل الشاشة الكامل كان»). The typed-chat
+     * agent could never SEE pixels (screen_capture said "for future vision
+     * models"): screen_vision closes that gap — REAL pixels (screencap →
+     * JPEG → base64, the exact LiveVision path) go straight to the
+     * vision-language model (LiveBrain.analyzeFrame, the same NVIDIA VL
+     * endpoint the live session uses) and a detailed honest description
+     * comes back as the tool output. Nothing is reduced to OCR text first.
+     */
+    suspend fun vision(context: android.content.Context, args: JSONObject): AgentTools.ToolResult {
+        if (!serviceReady()) return unavailable()
+        val frame = moe.shizuku.manager.sharingan.live.LiveVision.captureFrame(context)
+            ?: return AgentTools.ToolResult(
+                false, "screencap/encode failed — the aMiNo service may have dropped; retry once")
+        val q = args.optString("question", "").takeIf { it.isNotBlank() }
+        val desc = moe.shizuku.manager.sharingan.live.LiveBrain.analyzeFrame(context, frame.b64Jpeg, q)
+            ?: return AgentTools.ToolResult(
+                false, "the vision endpoint did not answer — set/check the live brain key and retry")
+        val head = buildString {
+            append("SCREEN (${frame.realW}x${frame.realH}px, md5 ${frame.md5.take(8)}):")
+            if (q != null) append("\nquestion: ${q.take(120)}")
+            append("\n\n")
+        }
+        return AgentTools.ToolResult(true, head + desc.take(3500))
     }
 }

@@ -440,7 +440,6 @@
     <string name="agent_stop">Stop</string>
     <string name="agent_new_chat">New conversation</string>
     <string name="agent_err_no_key">No API key configured. Open the Keys page and add one.</string>
-    <string name="agent_err_tool_rounds">Too many tool steps for one task — stopped for safety.</string>
     <string name="agent_err_network">Network error: %1$s</string>
     <string name="agent_err_internal">Internal error: %1$s</string>
     <string name="agent_cancelled_note">⏹ Execution cancelled by the user.</string>

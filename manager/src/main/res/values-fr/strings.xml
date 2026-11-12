@@ -352,7 +352,6 @@
     <string name="agent_stop">Arrêter</string>
     <string name="agent_new_chat">Nouvelle conversation</string>
     <string name="agent_err_no_key">Aucune clé API configurée. Ouvrez la page Clés.</string>
-    <string name="agent_err_tool_rounds">Trop d\'étapes d\'outils pour une tâche — arrêté par sécurité.</string>
     <string name="agent_err_network">Erreur réseau : %1$s</string>
     <string name="agent_err_internal">Erreur interne : %1$s</string>
     <string name="agent_cancelled_note">⏹ Exécution annulée par l\'utilisateur.</string>
