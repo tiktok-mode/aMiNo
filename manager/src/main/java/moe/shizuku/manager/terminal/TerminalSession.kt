@@ -65,8 +65,15 @@ class TerminalSession(
         private const val M = "__AMINO_T9_"
         private val RE_RC = Regex("__AMINO_T9_RC_(-?\\d+)")
         private val RE_FG = Regex("__AMINO_T9_FG_(-?\\d+)")
+        // r1446 — FST_<starttime-ticks>: field 22 of /proc/<pid>/stat for the
+        // tracked root, echoed by the wrapper right after FG. The (pid, ticks)
+        // pair is the root's kernel-grade identity — no recycle can repeat it.
+        private val RE_FST = Regex("__AMINO_T9_FST_(\\d+)")
         private val RE_CWD = Regex("__AMINO_T9_CWD_(.*)")
         private val RE_HI = Regex("__AMINO_T9_HI_(-?\\d+)")
+
+        // r1446 — per-execute identity sequence: the environ token generation.
+        private val eidGen = java.util.concurrent.atomic.AtomicLong(0)
         private const val ERRB = "__AMINO_T9_ERRB"
         private const val ERRE = "__AMINO_T9_ERRE"
 
@@ -89,6 +96,65 @@ class TerminalSession(
         /** Escape a user command for single-quoted eval embedding (newlines kept). */
         fun shellQuote(command: String): String =
             "'" + command.replace("'", "'\\''") + "'"
+
+        /**
+         * r1446 — the identity-checked tree-kill script (POSIX sh, mksh/toybox
+         * safe: no arrays, no pkill -P, integer sleep). Design (expert review,
+         * 2026-11-13): walking per-pid children globs under /proc needs
+         * CONFIG_PROC_CHILDREN which is NOT guaranteed on Android kernels, so
+         * the tree is identified by an exec token instead: execute() exports
+         * __AMINO_EID=<sid>_<seq> BEFORE forking the command subshell — every
+         * descendant inherits it (a process's /proc/<pid>/environ block is
+         * snapshotted at fork and survives exec). Membership is proven
+         * PER-VICTIM by a fixed-string word-boundary grep on each candidate's
+         * environ — strictly safer than ancestry: recycled pids fail the gate,
+         * mid-kill forks are caught, spoofed FG markers are refused, and the
+         * session shell itself can never match (its export mutates shell
+         * variables, not the fixed environ block from exec time). The script
+         * excludes itself (dollar-dollar) and its parent (dollar-PPID) like
+         * the r1400 sweep does. Self-bounded (≤ ~6s).
+         * Verdict: exactly one line "AMINO_STOP {gone|mismatch|stopped|alive} ck=N".
+         */
+        fun buildTreeKillScript(rootPid: Int, eid: String, startTicks: String?): String = buildString {
+            append("root=$rootPid\n")
+            append("eid=$eid\n")
+            append("fst=${startTicks ?: ""}\n")
+            append("me=\$\$; pp=\$PPID\n")
+            append("ck=0\n")
+            append("scan() {\n")
+            append("  for p in /proc/[0-9]*; do\n")
+            append("    q=\${p#/proc/}\n")
+            append("    [ \"\$q\" = \"\$me\" ] && continue\n")
+            append("    [ \"\$q\" = \"\$pp\" ] && continue\n")
+            append("    if grep -aqwF \"__amino_eid=\$eid\" /proc/\$q/environ 2>/dev/null; then\n")
+            append("      if kill -9 \"\$q\" 2>/dev/null; then\n")
+            append("        [ \"\$q\" = \"\$root\" ] || ck=\$((ck+1))\n")
+            append("      fi\n")
+            append("    fi\n")
+            append("  done\n")
+            append("}\n")
+            append("if kill -0 \"\$root\" 2>/dev/null; then :; else scan; echo \"AMINO_STOP gone ck=\$ck\"; exit 0; fi\n")
+            // r1446 — ROOT identity gate: /proc/<pid>/stat field 22 (starttime
+            // ticks) recorded by the FST marker at fork time. A recycled pid
+            // can NEVER repeat the (pid, ticks) pair — mismatch = kill REFUSED.
+            // Empty fst (compat/old marker) degrades honestly: no gate, the
+            // eid still protects every exec'd descendant in the scan.
+            append("if [ -n \"\$fst\" ]; then\n")
+            append("  cur=\$(sed -e 's/^[0-9]* (.*) //' /proc/\$root/stat 2>/dev/null | cut -d' ' -f20)\n")
+            append("  [ \"\$cur\" = \"\$fst\" ] || { echo \"AMINO_STOP mismatch ck=0\"; exit 0; }\n")
+            append("fi\n")
+            // r1446 (verify-B3) — the scan runs on EVERY path: even when the
+            // root already died on its own, its exec'd descendants (eid-tagged)
+            // are swept instead of leaking as orphans the sweep can never see.
+            append("scan\n")
+            append("kill -9 \"\$root\" 2>/dev/null\n")
+            append("i=0\n")
+            append("while [ \"\$i\" -lt 3 ]; do\n")
+            append("  if kill -0 \"\$root\" 2>/dev/null; then sleep 1; else break; fi\n")
+            append("  i=\$((i+1))\n")
+            append("done\n")
+            append("if kill -0 \"\$root\" 2>/dev/null; then echo \"AMINO_STOP alive ck=\$ck\"; else echo \"AMINO_STOP stopped ck=\$ck\"; fi\n")
+        }
     }
 
     private val crashGuard = CoroutineExceptionHandler { _, e ->
@@ -124,6 +190,14 @@ class TerminalSession(
     @Volatile var cwd: String? = null; private set
     @Volatile var lastExitCode: Int? = null; private set
     @Volatile var fgPid: Int? = null; private set
+    /** r1446 — identity-bound record of the CURRENT command's process tree (null when idle). */
+    @Volatile var currentProc: ProcessRecord? = null; private set
+    // r1446 — per-executing-command identity: the environ token every tree
+    // descendant inherits (exported by the wrapper BEFORE the fork) + the
+    // command text, bound into the ProcessRecord when the FG marker arrives.
+    private var pendingEid: String? = null
+    private var pendingCmd: String? = null
+    private var pendingFst: String? = null
     @Volatile var restarts = 0; private set
     val history = ArrayDeque<String>()             // commands typed in THIS session
 
@@ -513,6 +587,10 @@ class TerminalSession(
         val p = pb.start()
         proc = p
         stdin = p.outputStream
+        // r1446 (verify-A2) — generation-guard parity with linuxAttempt: the
+        // restart flow must invalidate the PREVIOUS attempt's stdout thread,
+        // or its later EOF (orphan exit) buries the freshly restarted session.
+        val gen = ++procGen
         val errCapture = StringBuilder()
         // native stderr pipe MUST be drained or the child can block on a full
         // pipe — r1399: drained as LINES through the same parser (bounded
@@ -534,7 +612,7 @@ class TerminalSession(
                 var line = r.readLine()
                 while (line != null) { parseLine(line); line = r.readLine() }
             } catch (_: Throwable) {}
-            onBackendDied()
+            if (gen == procGen) onBackendDied()   // r1446 (verify-A2) — only the CURRENT attempt may bury the session
         }, "amino-term-out-$id").apply { isDaemon = true; start() }
         alive = true
         // bounded wait for the HI marker (stderr or stdout), with ONE stdin
@@ -612,6 +690,12 @@ class TerminalSession(
         val wasAlive: Boolean
         synchronized(lock) { wasAlive = alive; alive = false; ready = false }
         if (!wasAlive) return
+        // r1446 — the backend died while a command's tree may still run: the
+        // record becomes an engine orphan for the sweep (the old code silently
+        // dropped both the pid and the truth), and the raw pid is cleared so a
+        // recycled pid can never be signaled later.
+        currentProc?.let { TerminalEngine.registerOrphan(it) }
+        currentProc = null; fgPid = null
         addSys("backend connection lost — the session will restart on the next command (shell state is reset)")
         failPending("backend connection lost")
     }
@@ -672,12 +756,38 @@ class TerminalSession(
         }
         RE_FG.find(line)?.let { m ->
             pendingFg = m.groupValues[1].toIntOrNull()
-            if ((pendingFg ?: 0) > 0) fgPid = pendingFg
+            if ((pendingFg ?: 0) > 0) {
+                fgPid = pendingFg
+                // r1446 — bind the IDENTITY at the moment the pid is learned:
+                // the wrapper echoes FG BEFORE wait now, so this is the CURRENT
+                // command's pid (the old post-wait echo left fgPid holding the
+                // PREVIOUS command's pid for the whole run — the A1 defect).
+                val pe = pendingEid
+                // r1446 (verify-A3) — bind ONCE per eid and carry the ticks
+                // already received: a duplicate/late FG line (any command can
+                // print a marker-shaped line to stdout) must never re-bind the
+                // record with startTicks=null — that would silently void the
+                // (pid,starttime) recycle gate for the RUNNING command.
+                if (pe != null && currentProc?.eid != pe) currentProc = ProcessRecord(
+                    pid = pendingFg!!, eid = pe,
+                    command = pendingCmd ?: "", startedAtMs = execStart,
+                    sessionId = id, backend = backend, adbPort = adbPort,
+                    startTicks = pendingFst
+                )
+            }
             maybeComplete(); return
         }
         RE_CWD.find(line)?.let { m ->
             pendingCwd = m.groupValues[1].trim()
             maybeComplete(); return
+        }
+        RE_FST.find(line)?.let { m ->
+            // r1446 — anchor the root's kernel identity the moment it is
+            // measurable: currentProc was just bound by the FG handler (FG is
+            // echoed before FST by the wrapper), so this is a copy-update.
+            pendingFst = m.groupValues[1]
+            currentProc = currentProc?.copy(startTicks = pendingFst)
+            return
         }
         if (line.isBlank() && !busy) return   // ignore stray newlines when idle
         appendLine(if (fromErr) TermLine.Kind.ERR else TermLine.Kind.OUT, line)
@@ -692,6 +802,11 @@ class TerminalSession(
         cwd = cd ?: cwd
         lastExitCode = rc
         busy = false
+        // r1446 — THIS command's tree finished: drop the binding AND the raw
+        // pid (the old code kept fgPid forever — a stale pid is a recycling
+        // hazard that could make a later stop signal an innocent process).
+        currentProc = null; fgPid = null
+        pendingEid = null; pendingCmd = null; pendingFst = null
         appendLine(TermLine.Kind.SYS, "rc=$rc" + (if (fg != null && fg > 0) " · pid $fg" else ""))
         val d = pending
         pending = null
@@ -709,6 +824,8 @@ class TerminalSession(
 
     private fun failPending(reason: String) {
         busy = false
+        errState = false
+        pendingEid = null; pendingCmd = null; pendingFst = null
         val d = pending
         pending = null
         val (o, e) = synchronized(lock) { outCap.toString() to errCap.toString() }
@@ -731,6 +848,11 @@ class TerminalSession(
             if (!alive || !ready) {
                 addSys("restarting session backend...")
                 restarts++
+                // r1446 (A6) — destroy the OLD backend handles first: the old
+                // code called start() without destroyBackend(), leaking the
+                // previous proc/adbShell/remoteProc and leaving its reader
+                // threads armed against the restarted session.
+                if (proc != null || adbShell != null || remoteProc != null) destroyBackend()
                 outCap = StringBuilder(); errCap = StringBuilder()
                 if (!start()) return@withLock ExecOutcome(
                     false, null, "", "", cwd, 0, false, false, null, true,
@@ -743,7 +865,14 @@ class TerminalSession(
             )
             execStart = System.currentTimeMillis()
             outCap = StringBuilder(); errCap = StringBuilder()
+            errState = false   // r1446 (verify-B4) — a death between ERRB/ERRE must not poison the next exchange
             pendingRc = null; pendingFg = null; pendingCwd = null
+            // r1446 — per-command identity token: zero-padded seq (fixed width
+            // means no eid can be a substring-prefix of another) exported by the
+            // wrapper BEFORE the fork so every tree descendant inherits it and
+            // the kill script can prove membership per victim.
+            val eid = "${id}_" + String.format(java.util.Locale.ROOT, "%06d", eidGen.incrementAndGet())
+            pendingEid = eid; pendingCmd = command
             appendLine(TermLine.Kind.CMD, command.replace("\n", " ⏎ "))
             if (history.lastOrNull() != command) { history.addLast(command); if (history.size > 50) history.removeFirst() }
             busy = true
@@ -761,10 +890,24 @@ class TerminalSession(
                     "echo \"$ERRB\" >&2; cat \"\$__amino_err\" 2>/dev/null >&2; echo \"$ERRE\" >&2; " +
                     "echo \"${M}RC_\${__amino_rc}\" >&2; echo \"${M}FG_0\" >&2; echo \"${M}CWD_\$PWD\" >&2\n"
             } else {
-                // external commands: background + tracked pid (killable, output streams live)
-                ": >\"\$__amino_err\"; eval $quoted 2>\"\$__amino_err\" & __amino_fg=\$!; " +
+                // external commands: background + tracked pid (killable, output
+                // streams live). r1446 — the eid is exported BEFORE the fork
+                // (every descendant inherits it in its environ), and the FG
+                // marker is echoed BEFORE wait (was: after — the old order left
+                // fgPid holding the PREVIOUS command's pid for the whole run,
+                // so every mid-run stop targeted the wrong process, A1).
+                ": >\"\$__amino_err\"; __amino_eid='$eid'; export __amino_eid; " +
+                    "eval $quoted 2>\"\$__amino_err\" & __amino_fg=\$!; " +
+                    "echo \"${M}FG_\${__amino_fg}\" >&2; " +
+                    // r1446 — FST: the root's /proc/<pid>/stat starttime ticks.
+                    // Platform truth (sandbox-proven 2026-11-13): an exported var
+                    // NEVER shows in a forked subshell's environ block (fixed at
+                    // exec time) — the (pid, ticks) pair is the only root gate the
+                    // kernel cannot fool by recycling. The eid still gates every
+                    // exec'd DESCENDANT in the kill scan (exec envp carries it).
+                    "echo \"${M}FST_\$(sed -e 's/^[0-9]* (.*) //' /proc/\${__amino_fg}/stat 2>/dev/null | cut -d' ' -f20)\" >&2; " +
                     "wait \"\$__amino_fg\"; __amino_rc=\$?; echo \"$ERRB\" >&2; cat \"\$__amino_err\" 2>/dev/null >&2; echo \"$ERRE\" >&2; " +
-                    "echo \"${M}RC_\${__amino_rc}\" >&2; echo \"${M}FG_\${__amino_fg}\" >&2; echo \"${M}CWD_\$PWD\" >&2\n"
+                    "echo \"${M}RC_\${__amino_rc}\" >&2; echo \"${M}CWD_\$PWD\" >&2\n"
             }
             writeRaw(wrapper)
 
@@ -795,80 +938,93 @@ class TerminalSession(
     }
 
     /**
-     * Stop the running foreground command. The tracked pid is killed OUT-OF-BAND
-     * (separate one-shot channel) so `wait` returns and the session keeps its
-     * cwd/env. If the kill cannot reach the process, the session is destroyed and
-     * transparently restarted (reported honestly).
+     * Stop the running foreground command — r1446 fire-and-forget wrapper kept
+     * for the UI call sites (TerminalActivity, LinuxAcceptance T7); the REAL
+     * logic is [stopProcessAwait]. The old version killed a bare pid out-of-band
+     * (which was the background SUBSHELL — often the PREVIOUS command's pid)
+     * and reported "process stopped" from an unconditional KILLDONE echo
+     * without ever verifying the process actually died.
      */
     fun stopProcess() {
-        val pid = fgPid
-        if (pid == null || pid <= 0) {
-            addSys("nothing to stop — no tracked process")
-            return
+        scope.launch { runCatching { stopProcessAwait() } }
+    }
+
+    /**
+     * r1446 — identity-checked, death-VERIFIED stop. The tracked record carries
+     * the per-execute environ token; TerminalEngine.runTreeKill matches
+     * /proc/<pid>/environ per victim before signaling (a recycled pid, a pid
+     * from a dead backend, or a spoofed FG marker is REFUSED, never harmed),
+     * waits for real death with kill -0 probes, and returns the honest verdict.
+     * Success is claimed ONLY for verified death (or pid-already-gone) — never
+     * for "the kill command was sent".
+     */
+    suspend fun stopProcessAwait(): StopOutcome {
+        val rec = currentProc
+        if (rec == null) {
+            val note = if (busy)
+                "command running but its pid marker has not arrived yet — retry in a moment"
+            else "nothing to stop — no tracked process"
+            addSys(note)
+            return StopOutcome(StopVerdict.NO_PROCESS, null, 0, false, note)
         }
-        addSys("stopping pid $pid...")
-        scope.launch {
-            var killed = false
-            try {
-                when (backend) {
-                    TermBackend.ADB_SHELL -> {
-                        val st = adbPort
-                        if (st != null) {
-                            val key = AdbKey(PreferenceAdbKeyStore(ShizukuSettings.getPreferences()), "amino")
-                            AdbClient("127.0.0.1", st, key).use { c ->
-                                c.connect()
-                                val sb = StringBuilder()
-                                c.command("shell:kill -9 $pid 2>/dev/null; echo KILLDONE") { b -> sb.append(String(b)) }
-                                killed = sb.toString().contains("KILLDONE")
-                            }
-                        }
-                    }
-                    TermBackend.LOCAL_APP -> {
-                        val p = ProcessBuilder("sh", "-c", "kill -9 $pid 2>/dev/null; echo KILLDONE")
-                            .start()
-                        val out = p.inputStream.bufferedReader().readText()
-                        p.waitFor()
-                        killed = out.contains("KILLDONE")
-                    }
-                    TermBackend.ROOT -> {
-                        // root-owned child: the app uid cannot signal it — try, then fall back
-                        killed = runCatching {
-                            val p = ProcessBuilder("sh", "-c", "kill -9 $pid 2>/dev/null; echo KILLDONE").start()
-                            val out = p.inputStream.bufferedReader().readText(); p.waitFor(); out.contains("KILLDONE")
-                        }.getOrDefault(false)
-                    }
-                    TermBackend.LINUX_USERSPACE -> {
-                        // the tracked pid is a GLOBAL pid inside the PRoot container;
-                        // the whole tree is owned by the shell identity, so the
-                        // service can kill it out-of-band while the session survives.
-                        killed = kotlinx.coroutines.runBlocking {
-                            moe.shizuku.manager.terminal.linux.LinuxEnvManager.killPid(pid)
-                        }
-                    }
-                    else -> {}
-                }
-            } catch (e: Throwable) {
-                Log.w(TAG, "out-of-band kill failed [$id]", e)
+        addSys("stopping pid ${rec.pid} (${rec.command.take(40)}) — identity-checked tree kill...")
+        val parsed = TerminalEngine.runTreeKill(rec)
+        val outcome = when (parsed?.verdict) {
+            "stopped" -> {
+                if (currentProc === rec) { currentProc = null; fgPid = null }   // r1446 (verify-B5) — never wipe a NEWER command's binding
+                // give the rc-marker flow a bounded moment to unblock `wait`
+                var waited = 0
+                while (busy && waited < 1500) { Thread.sleep(100); waited += 100 }
+                addSys("process stopped — verified dead; session state preserved (cwd: ${cwd ?: "?"})")
+                StopOutcome(StopVerdict.STOPPED_VERIFIED, rec, parsed.children, false,
+                    "verified stopped (children killed: ${parsed.children})" +
+                        if (busy) " — tree confirmed dead; the session wait is unblocking" else "")
             }
-            if (killed) {
-                // give the marker lines a moment to arrive
-                Thread.sleep(700)
-                if (busy) {
-                    addSys("process did not report back — restarting the session")
-                    destroyBackend(); restarts++; busy = false
-                    failPending("process force-stopped with its session")
-                } else {
-                    addSys("process stopped — session state preserved (cwd: ${cwd ?: "?"})")
-                }
-            } else {
-                addSys("out-of-band kill unavailable — restarting the session (state is lost)")
+            "gone" -> {
+                if (currentProc === rec) { currentProc = null; fgPid = null }
+                addSys("pid ${rec.pid} was already dead — eid-tagged descendants swept: ${parsed.children}")
+                StopOutcome(StopVerdict.PID_GONE_ALREADY, rec, parsed.children, false,
+                    "pid already dead — " +
+                        (if (parsed.children > 0) "${parsed.children} surviving descendant(s) swept by the environ scan"
+                        else "nothing was signaled"))
+            }
+            "mismatch" -> {
+                if (currentProc === rec) { currentProc = null; fgPid = null }
+                addSys("pid ${rec.pid} now belongs to a DIFFERENT process — kill REFUSED by the identity check")
+                StopOutcome(StopVerdict.IDENTITY_MISMATCH, rec, 0, false,
+                    "pid recycled or marker spoofed — kill refused (no innocent process was harmed)")
+            }
+            "alive" -> {
+                addSys("SIGKILL delivered but pid ${rec.pid} is STILL ALIVE after the death-wait — recorded as orphan for the sweep")
+                TerminalEngine.registerOrphan(rec)
+                StopOutcome(StopVerdict.STILL_ALIVE, rec, parsed.children, false,
+                    "SIGKILL delivered but the process survived the 3s death-wait (uninterruptible state?) — orphan sweep will retry")
+            }
+            else -> {
+                // KILL_UNAVAILABLE — the kill channel never answered honestly.
+                // Record the orphan (the sweep retries it), then destroy and
+                // restart the backend transparently — state loss is REPORTED.
+                TerminalEngine.registerOrphan(rec)
+                currentProc = null; fgPid = null
                 destroyBackend(); restarts++; busy = false
-                failPending("session restarted to stop the process")
+                failPending("kill channel unavailable — session restarted; process recorded as orphan for sweep")
+                addSys("out-of-band kill unreachable — session restarted (state is lost); the orphan sweep will retry the pid")
+                StopOutcome(StopVerdict.KILL_UNAVAILABLE, rec, 0, true,
+                    "kill channel unreachable — session restarted; process recorded as orphan for the sweep")
             }
         }
+        // r1446 (R4) — every stop is a lazy sweep trigger: bounded, honest,
+        // never a background daemon.
+        scope.launch { runCatching { TerminalEngine.sweepOrphans() } }
+        return outcome
     }
 
     private fun destroyBackend() {
+        // r1446 — invalidate stale reader threads FIRST (A3 parity), orphan the
+        // running tree if any, and clear the raw pid (recycling hazard).
+        procGen++
+        currentProc?.let { TerminalEngine.registerOrphan(it) }
+        currentProc = null; fgPid = null
         runCatching { adbShell?.close() }
         runCatching { proc?.destroy() }
         val rp = remoteProc
@@ -914,7 +1070,8 @@ class TerminalSession(
         id = id, name = displayName, backend = backend, agentSession = isAgentSession,
         alive = alive, ready = ready, busy = busy, cwd = cwd, lastExitCode = lastExitCode,
         fgPid = if (busy) fgPid else null, restarts = restarts,
-        lineCount = synchronized(lock) { lines.size }
+        lineCount = synchronized(lock) { lines.size },
+        process = if (busy) currentProc else null
     )
 
     /** r1395 — the last N system lines (launch evidence survives even after the fact). */

@@ -231,9 +231,11 @@ object ToolRegistry {
         RegisteredTool(
             ToolSpec(
                 "terminal_stop_process",
-                "Stop the running foreground command of a session (out-of-band kill of the tracked " +
-                    "pid). If the process cannot report back, the session restarts and this is " +
-                    "reported honestly.",
+                "Stop the running foreground command of a session: an identity-checked TREE kill " +
+                    "(root gated by its (pid,starttime) kernel identity, descendants gated by the per-execute " +
+                    "environ token — recycled pids are refused, never harmed) followed by a real death " +
+                    "verification. The JSON verdict reports stopped/verified/children_killed; success=true " +
+                    "ONLY when death is confirmed (or the pid was already gone) — never for a mere kill attempt.",
                 JSONObject().put("type", "object").put("properties",
                     JSONObject().put("session_id", JSONObject().put("type", "string")))
                     .put("required", org.json.JSONArray().put("session_id"))

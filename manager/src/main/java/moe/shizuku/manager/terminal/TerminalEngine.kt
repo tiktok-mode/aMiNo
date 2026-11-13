@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import moe.shizuku.manager.shell.ShellSession
 import java.io.File
@@ -39,6 +40,113 @@ object TerminalEngine {
 
     private val sessions = ConcurrentHashMap<String, TerminalSession>()
     private val idGen = AtomicInteger(1)
+
+    // ---------- r1446 orphan registry + identity-checked tree kill ----------
+
+    /**
+     * r1446 (R4) — orphaned process records: their session died or restarted
+     * but the tree may still be running. Bounded FIFO (32), deduped on
+     * pid+start-time+session (a recycled pid is a DIFFERENT process and gets
+     * its own record — the identity gate sorts it out at kill time).
+     */
+    private val orphans = ArrayList<ProcessRecord>()
+    // r1446 (verify-A1) — ONE shared monitor for the registry: registerOrphan
+    // runs on raw reader threads (backend-death path), the sweep on IO
+    // coroutines — two different monitors on one ArrayList was a
+    // ConcurrentModificationException crash path.
+    private val orphanLock = Any()
+
+    fun registerOrphan(rec: ProcessRecord) {
+        synchronized(orphanLock) {
+            if (orphans.any { it.pid == rec.pid && it.startedAtMs == rec.startedAtMs && it.sessionId == rec.sessionId }) return
+            if (orphans.size >= 32) orphans.removeAt(0)
+            orphans.add(rec)
+        }
+        Log.i(TAG, "orphan registered: pid ${rec.pid} [${rec.sessionId}/${rec.backend.id}] ${rec.command.take(50)}")
+    }
+
+    /** One tree-kill verdict parsed from the script's single AMINO_STOP line. */
+    internal class TreeKillResult(val verdict: String?, val children: Int)
+
+    /**
+     * r1446 — run the identity-checked tree-kill script for one record on the
+     * RIGHT out-of-band channel (never through the session's own streams):
+     *  - LOCAL_APP  : sh -c (app uid — same uid as the tree, environ readable)
+     *  - ROOT       : su -c (A4 fix — the old app-uid kill could NEVER signal
+     *                 root-owned children; running AS root also makes the
+     *                 environ identity reads succeed)
+     *  - ADB_SHELL  : the wireless debugging channel (r1416 soTimeout bounds it)
+     *  - LINUX      : service one-shot (shell uid — the PRoot tree's owner)
+     * The script itself is self-bounded (≤ ~6s); the coroutine cap adds 12s.
+     * The verdict line is "AMINO_STOP {gone|mismatch|stopped|alive} ck=N" —
+     * an unconditional echo (the old KILLDONE lie) can never pass as success.
+     */
+    internal suspend fun runTreeKill(rec: ProcessRecord): TreeKillResult? {
+        val script = TerminalSession.buildTreeKillScript(rec.pid, rec.eid, rec.startTicks)
+        return withTimeoutOrNull(12_000) {
+            try {
+                val out: String = when (rec.backend) {
+                    TermBackend.LOCAL_APP -> {
+                        val p = ProcessBuilder("sh", "-c", script).start()
+                        val o = p.inputStream.bufferedReader().readText(); p.waitFor(); o
+                    }
+                    TermBackend.ROOT -> {
+                        val p = ProcessBuilder("su", "-c", script).start()
+                        val o = p.inputStream.bufferedReader().readText(); p.waitFor(); o
+                    }
+                    TermBackend.ADB_SHELL -> {
+                        val port = rec.adbPort
+                        if (port == null || port <= 0) return@withTimeoutOrNull TreeKillResult(null, 0)
+                        val key = moe.shizuku.manager.adb.AdbKey(
+                            moe.shizuku.manager.adb.PreferenceAdbKeyStore(
+                                moe.shizuku.manager.ShizukuSettings.getPreferences()), "amino")
+                        val sb = StringBuilder()
+                        moe.shizuku.manager.adb.AdbClient("127.0.0.1", port, key).use { c ->
+                            c.connect()
+                            c.command("shell:$script") { b -> sb.append(String(b)) }
+                        }
+                        sb.toString()
+                    }
+                    TermBackend.LINUX_USERSPACE ->
+                        moe.shizuku.manager.terminal.linux.ShizukuExec.oneShot(script, 10_000).output
+                    else -> return@withTimeoutOrNull TreeKillResult(null, 0)
+                }
+                val m = Regex("AMINO_STOP (\\S+) ck=(\\d+)").find(out)
+                    ?: return@withTimeoutOrNull TreeKillResult(null, 0)
+                TreeKillResult(m.groupValues[1], m.groupValues[2].toIntOrNull() ?: 0)
+            } catch (e: Throwable) {
+                Log.w(TAG, "tree-kill channel failed for pid ${rec.pid} [${rec.backend.id}]: ${e.message}")
+                TreeKillResult(null, 0)
+            }
+        }
+    }
+
+    /**
+     * r1446 (R4) — orphan sweep: probe every recorded orphan with the SAME
+     * identity-checked script (never a blind kill). gone/stopped/mismatch ⇒
+     * the record's story ended — drop it; alive/unavailable ⇒ keep it (the
+     * next trigger retries). Lazy + bounded (max 8 per pass), triggered from
+     * stop results and session lifecycle — never a background daemon.
+     */
+    suspend fun sweepOrphans(limit: Int = 8): String {
+        val batch: List<ProcessRecord>
+        synchronized(orphanLock) { batch = orphans.take(limit) }
+        if (batch.isEmpty()) return "orphan sweep: registry empty"
+        var stopped = 0; var gone = 0; var refused = 0; var kept = 0
+        for (rec in batch) {
+            val v = runTreeKill(rec)?.verdict
+            val drop = when (v) {
+                "stopped" -> { stopped++; true }
+                "gone" -> { gone++; true }
+                "mismatch" -> { refused++; true }
+                else -> { kept++; false }   // alive or channel unavailable — retry later
+            }
+            if (drop) synchronized(orphanLock) { orphans.remove(rec) }
+        }
+        val summary = "orphan sweep: $stopped stopped, $gone already dead, $refused identity-refused, $kept kept for retry"
+        Log.i(TAG, summary)
+        return summary
+    }
 
     // ---------- discovery (spec B) ----------
 
@@ -321,12 +429,16 @@ object TerminalEngine {
             )
         }
         sessions[id] = s
+        // r1446 — a fresh session is a lazy orphan-sweep trigger: pids left by
+        // closed/restarted sessions get their identity-checked probe now.
+        scope.launch { runCatching { sweepOrphans() } }
         return s
     }
 
     fun close(id: String): Boolean {
         val s = sessions.remove(id) ?: return false
         s.close()
+        scope.launch { runCatching { sweepOrphans() } }
         return true
     }
 
@@ -334,5 +446,6 @@ object TerminalEngine {
     fun closeAll() {
         sessions.values.forEach { runCatching { it.close() } }
         sessions.clear()
+        scope.launch { runCatching { sweepOrphans() } }
     }
 }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import moe.shizuku.manager.agent.auto.CommandValidator
 import moe.shizuku.manager.terminal.ExecOutcome
+import moe.shizuku.manager.terminal.StopVerdict
 import moe.shizuku.manager.terminal.TermBackend
 import moe.shizuku.manager.terminal.TerminalEngine
 import moe.shizuku.manager.terminal.TerminalNet
@@ -176,23 +177,38 @@ object TerminalTools {
             .put("cwd", st.cwd ?: JSONObject.NULL)
             .put("last_exit_code", st.lastExitCode ?: JSONObject.NULL)
             .put("running_pid", st.fgPid ?: JSONObject.NULL)
+            .put("running_cmd", st.process?.command ?: JSONObject.NULL)
             .put("restarts", st.restarts).put("scrollback_lines", st.lineCount)
             .toString(2))
     }
 
     // ---------- 8) terminal_stop_process ----------
 
+    /**
+     * r1446 — the REAL verdict from the identity-checked, death-verified stop
+     * path. The old version pre-read fgPid (TOCTOU with the kill itself) and
+     * returned ToolResult(true, "kill sent out-of-band") SYNCHRONOUSLY for a
+     * kill that had not even started — success uncorrelated with reality.
+     * Now: success=true ONLY for verified-stopped / already-gone / genuinely
+     * nothing-running; mismatch, still_alive and kill_unavailable are honest
+     * failures the agent must report as such.
+     */
     fun stopProcess(sessionId: String): ToolResult {
         val s = TerminalEngine.getSession(sessionId)
             ?: return ToolResult(false, "unknown session '$sessionId'")
-        val pid = s.fgPid
-        s.stopProcess()
-        return ToolResult(true, JSONObject()
-            .put("session", s.id)
-            .put("stopped_pid", pid ?: JSONObject.NULL)
-            .put("note", if (pid != null && pid > 0)
-                "kill sent out-of-band; if the process does not report back the session restarts (reported honestly)"
-            else "no tracked process was running").toString(2))
+        val o = kotlinx.coroutines.runBlocking { s.stopProcessAwait() }
+        val stopped = o.verdict == StopVerdict.STOPPED_VERIFIED || o.verdict == StopVerdict.PID_GONE_ALREADY
+        val ok = stopped || (o.verdict == StopVerdict.NO_PROCESS && !s.busy)
+        return ToolResult(ok, JSONObject()
+            .put("session", s.id).put("environment", s.backend.id)
+            .put("pid", o.record?.pid ?: JSONObject.NULL)
+            .put("cmdline", o.record?.command ?: JSONObject.NULL)
+            .put("stopped", stopped)
+            .put("verified", stopped)
+            .put("children_killed", o.childrenKilled)
+            .put("session_restarted", o.sessionRestarted)
+            .put("verdict", o.verdict.name.lowercase())
+            .put("note", o.note).toString(2))
     }
 
     // ---------- 9) terminal_close_session ----------

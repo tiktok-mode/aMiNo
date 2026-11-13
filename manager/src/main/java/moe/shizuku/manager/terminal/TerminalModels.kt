@@ -82,5 +82,61 @@ data class SessionStatus(
     val lastExitCode: Int?,
     val fgPid: Int?,
     val restarts: Int,
-    val lineCount: Int
+    val lineCount: Int,
+    /** r1446 — the identity-bound record of the process currently believed to run (null when idle). */
+    val process: ProcessRecord? = null
+)
+
+/**
+ * r1446 — identity of ONE executed command's process tree. The Unix-pidfile
+ * lesson applied to the terminal: a bare pid is never trusted on its own —
+ * pids are recycled by the kernel, and the old `fgPid: Int` survived backend
+ * restarts, so a stop could signal an innocent recycled process.
+ *
+ * Two identity anchors, measured by the wrapper the moment the pid is known:
+ *  - [startTicks]: field 22 of /proc/<pid>/stat (starttime clock ticks) — the
+ *    (pid, starttime) pair is impossible for the kernel to recycle. This is
+ *    the ROOT gate: platform truth (sandbox-proven 2026-11-13) is that an
+ *    exported shell variable NEVER appears in a forked subshell's
+ *    /proc/<pid>/environ (that block is fixed at exec time) — so the tracked
+ *    background subshell can only be identity-gated by starttime.
+ *  - [eid]: the per-execute environ token. It DOES appear in the environ of
+ *    every exec'd descendant (the shell builds the exec envp from exported
+ *    vars), so it gates the scan loop per victim: a recycled descendant pid
+ *    fails the environ match and is never signaled.
+ */
+data class ProcessRecord(
+    val pid: Int,
+    val eid: String,
+    val command: String,
+    val startedAtMs: Long,
+    val sessionId: String,
+    val backend: TermBackend,
+    val adbPort: Int? = null,
+    val startTicks: String? = null
+)
+
+/** r1446 — the REAL verdict of a stop attempt. Success is claimed only for verified death. */
+enum class StopVerdict {
+    /** /proc probe confirms the root pid (and, via environ-identity, its tree) is dead. */
+    STOPPED_VERIFIED,
+    /** The pid was already dead before we signaled — a blind kill was prevented. */
+    PID_GONE_ALREADY,
+    /** The pid now belongs to a DIFFERENT process (recycled/spoofed) — kill REFUSED. */
+    IDENTITY_MISMATCH,
+    /** SIGKILL was delivered but the process is still alive after the death-wait. */
+    STILL_ALIVE,
+    /** The kill channel itself was unreachable/timed out — never claimed as stopped. */
+    KILL_UNAVAILABLE,
+    /** Nothing is tracked (no FG marker yet / idle session). */
+    NO_PROCESS
+}
+
+/** r1446 — full honest outcome of terminal_stop_process. */
+data class StopOutcome(
+    val verdict: StopVerdict,
+    val record: ProcessRecord?,
+    val childrenKilled: Int,
+    val sessionRestarted: Boolean,
+    val note: String
 )

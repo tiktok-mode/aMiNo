@@ -1950,11 +1950,12 @@ object LinuxEnvManager {
         return cmd to env
     }
 
-    /** Out-of-band kill for a tracked in-container pid (global pid namespace). */
-    suspend fun killPid(pid: Int): Boolean {
-        val s = ShizukuExec.oneShot("kill -9 $pid 2>/dev/null; echo KILLDONE", 10_000)
-        return s.ok && s.output.contains("KILLDONE")
-    }
+    // r1446 — killPid deleted: its `kill -9 $pid 2>/dev/null; echo KILLDONE`
+    // echoed KILLDONE unconditionally (success even on EPERM/ENOENT) and had
+    // no identity gate, no death verification, no child propagation. The
+    // replacement is TerminalEngine.runTreeKill — the environ-identity-checked
+    // tree kill executed through ShizukuExec.oneShot (same channel, honest
+    // AMINO_STOP verdict).
 
     /**
      * r1400 — the shared sweep script. SIGKILLs anything still bound to the
